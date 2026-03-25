@@ -1,11 +1,11 @@
 """
-LINE Todo Bot v3 - Interactive Flex Message + Comments
+LINE Todo Bot v4 - Interactive Buttons + Quick Reply
 ฟีเจอร์:
-  - เพิ่มงาน: พิมพ์ "เพิ่ม <ชื่องาน>"
-  - ดูงาน: กดปุ่ม interactive (เสร็จ/แก้ไข/ลบ/comment)
-  - แก้ไขงาน: พิมพ์ "แก้ <หมายเลข> <ชื่อใหม่>"
+  - ปุ่ม Quick Reply ทุกข้อความ (ไม่ต้องพิมพ์คำสั่ง!)
+  - กดปุ่ม "เพิ่มงาน" แล้วพิมพ์แค่ชื่องาน
+  - กดปุ่มบนการ์ด: เสร็จ / แก้ไข / ลบ / comment
+  - แก้ไขงาน: กดปุ่มแก้ไข แล้วพิมพ์ชื่อใหม่
   - comment งาน: พิมพ์ "note <หมายเลข> <ข้อความ>"
-  - ดู comment: พิมพ์ "ดูnote <หมายเลข>"
   - เข้างาน / สรุป / auto สรุป 18:00
 """
 
@@ -55,14 +55,15 @@ def verify_signature(body, signature):
 
 
 def reply_message(reply_token, messages):
-    """ส่งข้อความตอบกลับ (รับ list ของ messages)."""
     url = LINE_API_URL + "/message/reply"
     if isinstance(messages, str):
         messages = [{"type": "text", "text": messages}]
     elif isinstance(messages, dict):
         messages = [messages]
     data = {"replyToken": reply_token, "messages": messages}
-    requests.post(url, headers=line_headers(), json=data)
+    resp = requests.post(url, headers=line_headers(), json=data)
+    if resp.status_code != 200:
+        app.logger.error("Reply failed: {} {}".format(resp.status_code, resp.text))
 
 
 def push_message(to, messages):
@@ -72,7 +73,9 @@ def push_message(to, messages):
     elif isinstance(messages, dict):
         messages = [messages]
     data = {"to": to, "messages": messages}
-    requests.post(url, headers=line_headers(), json=data)
+    resp = requests.post(url, headers=line_headers(), json=data)
+    if resp.status_code != 200:
+        app.logger.error("Push failed: {} {}".format(resp.status_code, resp.text))
 
 
 def get_profile(user_id):
@@ -133,6 +136,43 @@ def init_db():
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                user_chat_key TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                data TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+# ============================================================
+# Pending Actions (จำสถานะว่า user กำลังจะทำอะไร)
+# ============================================================
+def set_pending_action(user_id, chat_id, action, data=""):
+    key = "{}:{}".format(user_id, chat_id)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_actions (user_chat_key, action, data, created_at) VALUES (?, ?, ?, ?)",
+            (key, action, data, datetime.now().isoformat()),
+        )
+
+
+def get_pending_action(user_id, chat_id):
+    key = "{}:{}".format(user_id, chat_id)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT action, data FROM pending_actions WHERE user_chat_key = ?", (key,)
+        ).fetchone()
+    if row:
+        return {"action": row["action"], "data": row["data"]}
+    return None
+
+
+def clear_pending_action(user_id, chat_id):
+    key = "{}:{}".format(user_id, chat_id)
+    with get_db() as conn:
+        conn.execute("DELETE FROM pending_actions WHERE user_chat_key = ?", (key,))
 
 
 # ============================================================
@@ -279,10 +319,33 @@ def get_task_by_id(task_id):
 
 
 # ============================================================
+# Quick Reply (ปุ่มด้านล่างทุกข้อความ)
+# ============================================================
+def build_quick_reply():
+    return {
+        "items": [
+            {"type": "action", "action": {"type": "postback", "label": "➕ เพิ่มงาน", "data": "action=add_prompt", "displayText": "➕ เพิ่มงาน"}},
+            {"type": "action", "action": {"type": "postback", "label": "📋 ดูงาน", "data": "action=list", "displayText": "📋 ดูงาน"}},
+            {"type": "action", "action": {"type": "postback", "label": "📊 สรุป", "data": "action=summary", "displayText": "📊 สรุป"}},
+            {"type": "action", "action": {"type": "message", "label": "🌅 เข้างาน", "text": "เข้างาน"}},
+            {"type": "action", "action": {"type": "postback", "label": "❓ วิธีใช้", "data": "action=help", "displayText": "❓ วิธีใช้"}},
+        ]
+    }
+
+
+def attach_quick_reply(msg):
+    """แปะ Quick Reply ให้กับทุกข้อความที่ส่งออก."""
+    if isinstance(msg, str):
+        msg = {"type": "text", "text": msg}
+    if isinstance(msg, dict) and "quickReply" not in msg:
+        msg["quickReply"] = build_quick_reply()
+    return msg
+
+
+# ============================================================
 # Flex Message Builders
 # ============================================================
 def build_task_card(task, index):
-    """สร้างการ์ดงานแต่ละชิ้น พร้อมปุ่มกด."""
     task_id = task["id"]
     added_info = ""
     if task["added_by"]:
@@ -290,7 +353,7 @@ def build_task_card(task, index):
 
     comments = get_comments(task_id)
     comment_count = len(comments)
-    comment_text = "💬 {} ความคิดเห็น".format(comment_count) if comment_count > 0 else "💬 ยังไม่มีความคิดเห็น"
+    comment_text = "💬 {} comment".format(comment_count) if comment_count > 0 else "💬 ยังไม่มี comment"
 
     card = {
         "type": "bubble",
@@ -397,10 +460,9 @@ def build_task_card(task, index):
 
 
 def build_task_list_flex(chat_id):
-    """สร้าง Flex Carousel แสดงงานค้างทั้งหมด."""
     pending = get_pending_tasks(chat_id)
     if not pending:
-        return {"type": "text", "text": "🎉 ไม่มีงานค้าง! เยี่ยมไปเลย!"}
+        return attach_quick_reply("🎉 ไม่มีงานค้าง! เยี่ยมไปเลย!")
 
     bubbles = []
     for i, task in enumerate(pending, 1):
@@ -409,23 +471,22 @@ def build_task_list_flex(chat_id):
             break
 
     if len(bubbles) == 1:
-        return {"type": "flex", "altText": "📋 งานค้าง {} งาน".format(len(pending)), "contents": bubbles[0]}
+        return attach_quick_reply({"type": "flex", "altText": "📋 งานค้าง {} งาน".format(len(pending)), "contents": bubbles[0]})
 
-    return {
+    return attach_quick_reply({
         "type": "flex",
         "altText": "📋 งานค้าง {} งาน".format(len(pending)),
         "contents": {
             "type": "carousel",
             "contents": bubbles,
         },
-    }
+    })
 
 
 def build_comment_flex(task_id):
-    """สร้าง Flex แสดง comment ของงาน."""
     task = get_task_by_id(task_id)
     if not task:
-        return {"type": "text", "text": "❌ ไม่พบงานนี้"}
+        return attach_quick_reply("❌ ไม่พบงานนี้")
 
     comments = get_comments(task_id)
 
@@ -462,7 +523,7 @@ def build_comment_flex(task_id):
                     },
                     {
                         "type": "text",
-                        "text": time_str,
+                        "text": time_str if time_str else "-",
                         "size": "xxs",
                         "color": "#999999",
                         "flex": 1,
@@ -474,9 +535,8 @@ def build_comment_flex(task_id):
     else:
         comment_contents.append({
             "type": "text",
-            "text": "ยังไม่มีความคิดเห็น",
+            "text": "ยังไม่มี comment",
             "size": "sm",
-            "color": "#999999",
             "color": "#AAAAAA",
         })
 
@@ -488,7 +548,7 @@ def build_comment_flex(task_id):
             "contents": [
                 {
                     "type": "text",
-                    "text": "💬 ความคิดเห็น",
+                    "text": "💬 Comment",
                     "weight": "bold",
                     "color": "#1DB446",
                     "size": "md",
@@ -517,7 +577,7 @@ def build_comment_flex(task_id):
             "contents": [
                 {
                     "type": "text",
-                    "text": 'พิมพ์ "note {} <ข้อความ>" เพื่อเพิ่ม'.format(task_id),
+                    "text": "พิมพ์ \"note {} ข้อความ\" เพื่อเพิ่ม".format(task_id),
                     "size": "xs",
                     "color": "#999999",
                     "align": "center",
@@ -527,11 +587,10 @@ def build_comment_flex(task_id):
         },
     }
 
-    return {"type": "flex", "altText": "💬 comment: {}".format(task["title"]), "contents": bubble}
+    return attach_quick_reply({"type": "flex", "altText": "💬 comment: {}".format(task["title"]), "contents": bubble})
 
 
 def build_clock_in_flex(chat_id):
-    """สร้าง Flex Message ตอนเข้างาน."""
     now = datetime.now()
     pending = get_pending_tasks(chat_id)
 
@@ -598,7 +657,7 @@ def build_clock_in_flex(chat_id):
                 },
                 {
                     "type": "button",
-                    "action": {"type": "postback", "label": "📊 สรุป", "data": "action=summary"},
+                    "action": {"type": "postback", "label": "➕ เพิ่มงาน", "data": "action=add_prompt"},
                     "style": "secondary",
                     "height": "sm",
                     "margin": "sm",
@@ -608,16 +667,14 @@ def build_clock_in_flex(chat_id):
         },
     }
 
-    return {"type": "flex", "altText": "🌅 เข้างาน - งานวันนี้ {} งาน".format(len(pending)), "contents": bubble}
+    return attach_quick_reply({"type": "flex", "altText": "🌅 เข้างาน - งานวันนี้ {} งาน".format(len(pending)), "contents": bubble})
 
 
 def build_daily_summary_flex(chat_id):
-    """สร้าง Flex สรุปรายวัน."""
     now = datetime.now()
     completed = get_completed_today(chat_id)
     pending = get_pending_tasks(chat_id)
 
-    # สร้างรายการงานเสร็จ
     done_items = []
     if completed:
         for task in completed:
@@ -631,7 +688,6 @@ def build_daily_summary_flex(chat_id):
     else:
         done_items.append({"type": "text", "text": "  — ยังไม่มี", "size": "xs", "color": "#999999"})
 
-    # สร้างรายการงานค้าง
     pending_items = []
     if pending:
         for i, task in enumerate(pending, 1):
@@ -645,7 +701,6 @@ def build_daily_summary_flex(chat_id):
     else:
         pending_items.append({"type": "text", "text": "  — ไม่มีงานค้าง! 🎉", "size": "xs", "color": "#1DB446"})
 
-    # สรุป
     if len(completed) > 0 and len(pending) == 0:
         summary_text = "🏆 ยอดเยี่ยม! ทำงานเสร็จหมด!"
         summary_color = "#1DB446"
@@ -685,170 +740,185 @@ def build_daily_summary_flex(chat_id):
         },
     }
 
-    return {"type": "flex", "altText": "📊 สรุปวัน - เสร็จ {} ค้าง {}".format(len(completed), len(pending)), "contents": bubble}
-
-
-def build_quick_reply():
-    """สร้าง Quick Reply ปุ่มด้านล่าง."""
-    return {
-        "items": [
-            {"type": "action", "action": {"type": "postback", "label": "📋 ดูงาน", "data": "action=list"}},
-            {"type": "action", "action": {"type": "postback", "label": "📊 สรุป", "data": "action=summary"}},
-            {"type": "action", "action": {"type": "message", "label": "🌅 เข้างาน", "text": "เข้างาน"}},
-            {"type": "action", "action": {"type": "message", "label": "❓ วิธีใช้", "text": "help"}},
-        ]
-    }
+    return attach_quick_reply({"type": "flex", "altText": "📊 สรุปวัน - เสร็จ {} ค้าง {}".format(len(completed), len(pending)), "contents": bubble})
 
 
 def build_help_message():
-    return {
-        "type": "flex",
-        "altText": "📖 วิธีใช้ Todo Bot",
-        "contents": {
-            "type": "bubble",
-            "header": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": "📖 วิธีใช้ Todo Bot", "weight": "bold", "size": "lg", "color": "#1DB446"},
-                ],
-                "paddingAll": "15px",
-                "backgroundColor": "#F5FFF5",
-            },
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": "📝 เพิ่มงาน", "weight": "bold", "size": "sm", "color": "#1DB446"},
-                    {"type": "text", "text": 'พิมพ์ "เพิ่ม ส่งรายงาน"', "size": "xs", "color": "#666666", "margin": "sm"},
+    bubble = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "📖 วิธีใช้ Todo Bot", "weight": "bold", "size": "lg", "color": "#1DB446"},
+            ],
+            "paddingAll": "15px",
+            "backgroundColor": "#F5FFF5",
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "🔘 กดปุ่มด้านล่างได้เลย!", "weight": "bold", "size": "sm", "color": "#FF6B35"},
+                {"type": "text", "text": "ทุกข้อความจะมีปุ่มให้กดเสมอ", "size": "xs", "color": "#666666", "margin": "sm"},
 
-                    {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "📋 ดูงาน (กดปุ่มได้!)", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "งานค้าง" หรือ "ดูงาน"', "size": "xs", "color": "#666666", "margin": "sm"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": "➕ เพิ่มงาน", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
+                {"type": "text", "text": "กดปุ่ม [➕ เพิ่มงาน] แล้วพิมพ์ชื่องาน", "size": "xs", "color": "#666666", "margin": "sm"},
+                {"type": "text", "text": "หรือพิมพ์ \"เพิ่ม ส่งรายงาน\"", "size": "xs", "color": "#666666", "margin": "xs"},
 
-                    {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "✏️ แก้ไขงาน", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "แก้ 1 ชื่องานใหม่"', "size": "xs", "color": "#666666", "margin": "sm"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": "📋 ดูงาน (กดปุ่มบนการ์ดได้!)", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
+                {"type": "text", "text": "กดปุ่ม [📋 ดูงาน] เพื่อดูงานค้าง", "size": "xs", "color": "#666666", "margin": "sm"},
+                {"type": "text", "text": "แต่ละงานมีปุ่ม: เสร็จ / แก้ไข / comment / ลบ", "size": "xs", "color": "#666666", "margin": "xs"},
 
-                    {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "💬 เพิ่ม comment", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "note 1 รอข้อมูลจากลูกค้า"', "size": "xs", "color": "#666666", "margin": "sm"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": "💬 เพิ่ม comment", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
+                {"type": "text", "text": "พิมพ์ \"note 1 รอข้อมูลจากลูกค้า\"", "size": "xs", "color": "#666666", "margin": "sm"},
 
-                    {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "🌅 เข้างาน / 📊 สรุป", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "เข้างาน" หรือ "สรุป"', "size": "xs", "color": "#666666", "margin": "sm"},
-
-                    {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "⏰ auto สรุปทุกวัน 18:00 น.", "size": "xs", "color": "#999999", "margin": "lg", "align": "center"},
-                    {"type": "text", "text": "ใช้ได้ทั้งแชทกลุ่มและส่วนตัว!", "size": "xs", "color": "#999999", "margin": "sm", "align": "center"},
-                ],
-                "paddingAll": "15px",
-            },
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": "⏰ auto สรุปทุกวัน 18:00 น.", "size": "xs", "color": "#999999", "margin": "lg", "align": "center"},
+                {"type": "text", "text": "ใช้ได้ทั้งแชทกลุ่มและส่วนตัว!", "size": "xs", "color": "#999999", "margin": "sm", "align": "center"},
+            ],
+            "paddingAll": "15px",
         },
     }
+    return attach_quick_reply({"type": "flex", "altText": "📖 วิธีใช้ Todo Bot", "contents": bubble})
 
 
 # ============================================================
 # Command Processing (Text)
 # ============================================================
-def process_command(text, chat_id, display_name=""):
-    text_lower = text.lower().strip()
+def process_command(text, chat_id, user_id="", display_name=""):
+    text_stripped = text.strip()
+    text_lower = text_stripped.lower()
 
-    # เข้างาน
+    # ---- Check pending action first ----
+    pending = get_pending_action(user_id, chat_id)
+    if pending:
+        action = pending["action"]
+        data = pending["data"]
+        clear_pending_action(user_id, chat_id)
+
+        # ยกเว้น: ถ้าพิมพ์คำสั่งอื่นแทน ให้ข้ามไป
+        if text_lower not in ["ยกเลิก", "cancel"] and not text_lower.startswith(("เพิ่ม ", "add ", "todo ", "งานค้าง", "ดูงาน", "list", "สรุป", "summary", "เข้างาน", "help")):
+            if action == "waiting_add":
+                task = add_task(chat_id, text_stripped, added_by=display_name)
+                pending_count = len(get_pending_tasks(chat_id))
+                return attach_quick_reply({
+                    "type": "text",
+                    "text": "✅ เพิ่มงานแล้ว!\n📝 {}\n📌 งานค้างทั้งหมด: {} งาน".format(task["title"], pending_count),
+                })
+
+            elif action == "waiting_edit" and data:
+                task_id = int(data)
+                result = edit_task_by_id(task_id, text_stripped)
+                if result:
+                    return attach_quick_reply({
+                        "type": "text",
+                        "text": "✏️ แก้ไขแล้ว!\nเดิม: {}\nใหม่: {}".format(result["old_title"], result["new_title"]),
+                    })
+                return attach_quick_reply("❌ ไม่พบงานนี้")
+
+        if text_lower in ["ยกเลิก", "cancel"]:
+            return attach_quick_reply("❌ ยกเลิกแล้ว")
+
+    # ---- เข้างาน ----
     if text_lower in ["เข้างาน", "clock in", "เริ่มงาน"]:
         return build_clock_in_flex(chat_id)
 
-    # เพิ่มงาน
-    match_add = re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)", text, re.IGNORECASE)
+    # ---- เพิ่มงาน (มีชื่องานต่อท้าย) ----
+    match_add = re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)", text_stripped, re.IGNORECASE)
     if match_add:
         title = match_add.group(1).strip()
         task = add_task(chat_id, title, added_by=display_name)
         pending_count = len(get_pending_tasks(chat_id))
-        msg = {
+        return attach_quick_reply({
             "type": "text",
             "text": "✅ เพิ่มงานแล้ว!\n📝 {}\n📌 งานค้างทั้งหมด: {} งาน".format(task["title"], pending_count),
-            "quickReply": build_quick_reply(),
-        }
-        return msg
+        })
 
-    # ดูงานค้าง
-    if text_lower in ["งานค้าง", "ดูงาน", "list", "tasks", "รายการ", "ดู", "ดูงาน"]:
+    # ---- เพิ่ม (เฉยๆ ไม่มีชื่อ) → ถามชื่องาน ----
+    if text_lower in ["เพิ่ม", "add", "todo", "เพิ่มงาน"]:
+        set_pending_action(user_id, chat_id, "waiting_add")
+        return attach_quick_reply("📝 พิมพ์ชื่องานที่ต้องการเพิ่มเลยครับ\n\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
+
+    # ---- ดูงานค้าง ----
+    if text_lower in ["งานค้าง", "ดูงาน", "list", "tasks", "รายการ", "ดู"]:
         return build_task_list_flex(chat_id)
 
-    # แก้ไขงาน
-    match_edit = re.match(r"^(?:แก้|edit)\s+(\d+)\s+(.+)", text, re.IGNORECASE)
+    # ---- แก้ไขงาน by number ----
+    match_edit = re.match(r"^(?:แก้|edit)\s+(\d+)\s+(.+)", text_stripped, re.IGNORECASE)
     if match_edit:
         num = int(match_edit.group(1))
         new_title = match_edit.group(2).strip()
         result = edit_task(chat_id, num, new_title)
         if result:
-            return {"type": "text", "text": "✏️ แก้ไขแล้ว!\nเดิม: {}\nใหม่: {}".format(result["old_title"], result["new_title"]), "quickReply": build_quick_reply()}
-        return {"type": "text", "text": "❌ ไม่พบงานหมายเลข {}".format(num)}
+            return attach_quick_reply("✏️ แก้ไขแล้ว!\nเดิม: {}\nใหม่: {}".format(result["old_title"], result["new_title"]))
+        return attach_quick_reply("❌ ไม่พบงานหมายเลข {}".format(num))
 
-    # แก้ไขงาน by ID (จากปุ่มกด)
-    match_edit_id = re.match(r"^(?:editid)\s+(\d+)\s+(.+)", text, re.IGNORECASE)
+    # ---- แก้ไขงาน by ID (จากปุ่มกด) ----
+    match_edit_id = re.match(r"^(?:editid)\s+(\d+)\s+(.+)", text_stripped, re.IGNORECASE)
     if match_edit_id:
         task_id = int(match_edit_id.group(1))
         new_title = match_edit_id.group(2).strip()
         result = edit_task_by_id(task_id, new_title)
         if result:
-            return {"type": "text", "text": "✏️ แก้ไขแล้ว!\nเดิม: {}\nใหม่: {}".format(result["old_title"], result["new_title"]), "quickReply": build_quick_reply()}
-        return {"type": "text", "text": "❌ ไม่พบงานนี้"}
+            return attach_quick_reply("✏️ แก้ไขแล้ว!\nเดิม: {}\nใหม่: {}".format(result["old_title"], result["new_title"]))
+        return attach_quick_reply("❌ ไม่พบงานนี้")
 
-    # เสร็จงาน
-    match_done = re.match(r"^(?:เสร็จ|done|✅)\s*(\d+)", text, re.IGNORECASE)
+    # ---- เสร็จงาน ----
+    match_done = re.match(r"^(?:เสร็จ|done|✅)\s*(\d+)", text_stripped, re.IGNORECASE)
     if match_done:
         num = int(match_done.group(1))
         task = complete_task(chat_id, num)
         if task:
             pending_count = len(get_pending_tasks(chat_id))
-            return {"type": "text", "text": "✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ: {} งาน".format(task["title"], pending_count), "quickReply": build_quick_reply()}
-        return {"type": "text", "text": "❌ ไม่พบงานหมายเลข {}".format(num)}
+            return attach_quick_reply("✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ: {} งาน".format(task["title"], pending_count))
+        return attach_quick_reply("❌ ไม่พบงานหมายเลข {}".format(num))
 
-    # ลบงาน
-    match_delete = re.match(r"^(?:ลบ|delete|remove)\s*(\d+)", text, re.IGNORECASE)
+    # ---- ลบงาน ----
+    match_delete = re.match(r"^(?:ลบ|delete|remove)\s*(\d+)", text_stripped, re.IGNORECASE)
     if match_delete:
         num = int(match_delete.group(1))
         task = delete_task(chat_id, num)
         if task:
-            return {"type": "text", "text": "🗑️ ลบแล้ว: {}".format(task["title"]), "quickReply": build_quick_reply()}
-        return {"type": "text", "text": "❌ ไม่พบงานหมายเลข {}".format(num)}
+            return attach_quick_reply("🗑️ ลบแล้ว: {}".format(task["title"]))
+        return attach_quick_reply("❌ ไม่พบงานหมายเลข {}".format(num))
 
-    # เพิ่ม comment (note <task_number or task_id> <content>)
-    match_note = re.match(r"^(?:note|โน้ต|คอมเม้น|comment)\s+(\d+)\s+(.+)", text, re.IGNORECASE)
+    # ---- เพิ่ม comment ----
+    match_note = re.match(r"^(?:note|โน้ต|คอมเม้น|comment)\s+(\d+)\s+(.+)", text_stripped, re.IGNORECASE)
     if match_note:
         task_ref = int(match_note.group(1))
         content = match_note.group(2).strip()
-        # ลองหา by ID ก่อน
         task = get_task_by_id(task_ref)
         if not task or task["chat_id"] != chat_id:
-            # ลองเป็นลำดับ
-            pending = get_pending_tasks(chat_id)
-            if 1 <= task_ref <= len(pending):
-                task = pending[task_ref - 1]
+            pending_list = get_pending_tasks(chat_id)
+            if 1 <= task_ref <= len(pending_list):
+                task = pending_list[task_ref - 1]
         if task:
             add_comment(task["id"], chat_id, display_name, content)
-            return {"type": "text", "text": "💬 เพิ่ม comment แล้ว!\n📝 งาน: {}\n💭 {}".format(task["title"], content), "quickReply": build_quick_reply()}
-        return {"type": "text", "text": "❌ ไม่พบงานหมายเลข {}".format(task_ref)}
+            return attach_quick_reply("💬 เพิ่ม comment แล้ว!\n📝 งาน: {}\n💭 {}".format(task["title"], content))
+        return attach_quick_reply("❌ ไม่พบงานหมายเลข {}".format(task_ref))
 
-    # ดู comment
-    match_view_note = re.match(r"^(?:ดูnote|ดูโน้ต|viewnote)\s*(\d+)", text, re.IGNORECASE)
+    # ---- ดู comment ----
+    match_view_note = re.match(r"^(?:ดูnote|ดูโน้ต|viewnote)\s*(\d+)", text_stripped, re.IGNORECASE)
     if match_view_note:
         task_ref = int(match_view_note.group(1))
         task = get_task_by_id(task_ref)
         if not task or task["chat_id"] != chat_id:
-            pending = get_pending_tasks(chat_id)
-            if 1 <= task_ref <= len(pending):
-                task = pending[task_ref - 1]
+            pending_list = get_pending_tasks(chat_id)
+            if 1 <= task_ref <= len(pending_list):
+                task = pending_list[task_ref - 1]
         if task:
             return build_comment_flex(task["id"])
-        return {"type": "text", "text": "❌ ไม่พบงานหมายเลข {}".format(task_ref)}
+        return attach_quick_reply("❌ ไม่พบงานหมายเลข {}".format(task_ref))
 
-    # สรุป
+    # ---- สรุป ----
     if text_lower in ["สรุป", "summary", "รายงาน", "report"]:
         return build_daily_summary_flex(chat_id)
 
-    # help
+    # ---- help ----
     if text_lower in ["help", "วิธีใช้", "ช่วย", "คำสั่ง", "?", "เมนู", "menu"]:
         return build_help_message()
 
@@ -858,8 +928,7 @@ def process_command(text, chat_id, display_name=""):
 # ============================================================
 # Postback Handling (ปุ่มกด)
 # ============================================================
-def handle_postback(data_str, chat_id, reply_token, display_name=""):
-    """จัดการ postback จากปุ่มกด."""
+def handle_postback(data_str, chat_id, reply_token, user_id="", display_name=""):
     params = {}
     for part in data_str.split("&"):
         if "=" in part:
@@ -869,38 +938,36 @@ def handle_postback(data_str, chat_id, reply_token, display_name=""):
     action = params.get("action", "")
     task_id = params.get("task_id", "")
 
-    if action == "done" and task_id:
+    if action == "add_prompt":
+        set_pending_action(user_id, chat_id, "waiting_add")
+        reply_message(reply_token, attach_quick_reply("📝 พิมพ์ชื่องานที่ต้องการเพิ่มเลยครับ\n\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)"))
+
+    elif action == "done" and task_id:
         task = complete_task_by_id(int(task_id))
         if task:
             pending_count = len(get_pending_tasks(chat_id))
-            reply_message(reply_token, {
-                "type": "text",
-                "text": "✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ: {} งาน".format(task["title"], pending_count),
-                "quickReply": build_quick_reply(),
-            })
+            reply_message(reply_token, attach_quick_reply(
+                "✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ: {} งาน".format(task["title"], pending_count)
+            ))
         else:
-            reply_message(reply_token, "❌ งานนี้เสร็จไปแล้วหรือไม่พบ")
+            reply_message(reply_token, attach_quick_reply("❌ งานนี้เสร็จไปแล้วหรือไม่พบ"))
 
     elif action == "delete" and task_id:
         task = delete_task_by_id(int(task_id))
         if task:
-            reply_message(reply_token, {
-                "type": "text",
-                "text": "🗑️ ลบแล้ว: {}".format(task["title"]),
-                "quickReply": build_quick_reply(),
-            })
+            reply_message(reply_token, attach_quick_reply("🗑️ ลบแล้ว: {}".format(task["title"])))
         else:
-            reply_message(reply_token, "❌ ไม่พบงานนี้")
+            reply_message(reply_token, attach_quick_reply("❌ ไม่พบงานนี้"))
 
     elif action == "edit_prompt" and task_id:
         task = get_task_by_id(int(task_id))
         if task:
-            reply_message(reply_token, {
-                "type": "text",
-                "text": '✏️ ต้องการแก้ไขงาน: "{}"\n\nพิมพ์:\neditid {} ชื่องานใหม่'.format(task["title"], task_id),
-            })
+            set_pending_action(user_id, chat_id, "waiting_edit", task_id)
+            reply_message(reply_token, attach_quick_reply(
+                "✏️ แก้ไขงาน: \"{}\"\n\nพิมพ์ชื่องานใหม่เลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)".format(task["title"])
+            ))
         else:
-            reply_message(reply_token, "❌ ไม่พบงานนี้")
+            reply_message(reply_token, attach_quick_reply("❌ ไม่พบงานนี้"))
 
     elif action == "view_comments" and task_id:
         msg = build_comment_flex(int(task_id))
@@ -912,6 +979,10 @@ def handle_postback(data_str, chat_id, reply_token, display_name=""):
 
     elif action == "summary":
         msg = build_daily_summary_flex(chat_id)
+        reply_message(reply_token, msg)
+
+    elif action == "help":
+        msg = build_help_message()
         reply_message(reply_token, msg)
 
 
@@ -930,34 +1001,38 @@ def callback():
     events = data.get("events", [])
 
     for event in events:
-        reply_token = event.get("replyToken", "")
-        source = event.get("source", {})
-        source_type = source.get("type", "")
+        try:
+            reply_token = event.get("replyToken", "")
+            source = event.get("source", {})
+            source_type = source.get("type", "")
 
-        if source_type == "group":
-            chat_id = source.get("groupId", "")
-        elif source_type == "room":
-            chat_id = source.get("roomId", "")
-        else:
-            chat_id = source.get("userId", "")
+            if source_type == "group":
+                chat_id = source.get("groupId", "")
+            elif source_type == "room":
+                chat_id = source.get("roomId", "")
+            else:
+                chat_id = source.get("userId", "")
 
-        user_id = source.get("userId", "")
-        display_name = get_profile(user_id) if user_id else ""
+            user_id = source.get("userId", "")
+            display_name = get_profile(user_id) if user_id else ""
 
-        if display_name and chat_id != user_id:
-            register_member(chat_id, user_id, display_name)
+            if display_name and chat_id != user_id:
+                register_member(chat_id, user_id, display_name)
 
-        # Text message
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-            text = event["message"]["text"].strip()
-            result = process_command(text, chat_id, display_name)
-            if result:
-                reply_message(reply_token, result)
+            # Text message
+            if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+                text = event["message"]["text"].strip()
+                result = process_command(text, chat_id, user_id, display_name)
+                if result:
+                    reply_message(reply_token, result)
 
-        # Postback (ปุ่มกด)
-        elif event.get("type") == "postback":
-            postback_data = event.get("postback", {}).get("data", "")
-            handle_postback(postback_data, chat_id, reply_token, display_name)
+            # Postback (ปุ่มกด)
+            elif event.get("type") == "postback":
+                postback_data = event.get("postback", {}).get("data", "")
+                handle_postback(postback_data, chat_id, reply_token, user_id, display_name)
+
+        except Exception as e:
+            app.logger.error("Error processing event: {}".format(e))
 
     return "OK"
 
@@ -980,7 +1055,7 @@ def send_daily_summary():
 # ============================================================
 @app.route("/", methods=["GET"])
 def health():
-    return "LINE Todo Bot v3 is running! 🤖"
+    return "LINE Todo Bot v4 is running! 🤖"
 
 
 init_db()
