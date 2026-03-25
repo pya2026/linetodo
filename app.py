@@ -477,7 +477,7 @@ def build_comment_flex(task_id):
             "text": "ยังไม่มีความคิดเห็น",
             "size": "sm",
             "color": "#999999",
-            "style": "italic",
+            "color": "#AAAAAA",
         })
 
     bubble = {
@@ -720,27 +720,27 @@ def build_help_message():
                 "layout": "vertical",
                 "contents": [
                     {"type": "text", "text": "📝 เพิ่มงาน", "weight": "bold", "size": "sm", "color": "#1DB446"},
-                    {"type": "text", "text": 'พิมพ์ "เพิ่ม ส่งรายงาน"', "size": "xs", "color": "#666", "margin": "sm"},
+                    {"type": "text", "text": 'พิมพ์ "เพิ่ม ส่งรายงาน"', "size": "xs", "color": "#666666", "margin": "sm"},
 
                     {"type": "separator", "margin": "lg"},
                     {"type": "text", "text": "📋 ดูงาน (กดปุ่มได้!)", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "งานค้าง" หรือ "ดูงาน"', "size": "xs", "color": "#666", "margin": "sm"},
+                    {"type": "text", "text": 'พิมพ์ "งานค้าง" หรือ "ดูงาน"', "size": "xs", "color": "#666666", "margin": "sm"},
 
                     {"type": "separator", "margin": "lg"},
                     {"type": "text", "text": "✏️ แก้ไขงาน", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "แก้ 1 ชื่องานใหม่"', "size": "xs", "color": "#666", "margin": "sm"},
+                    {"type": "text", "text": 'พิมพ์ "แก้ 1 ชื่องานใหม่"', "size": "xs", "color": "#666666", "margin": "sm"},
 
                     {"type": "separator", "margin": "lg"},
                     {"type": "text", "text": "💬 เพิ่ม comment", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "note 1 รอข้อมูลจากลูกค้า"', "size": "xs", "color": "#666", "margin": "sm"},
+                    {"type": "text", "text": 'พิมพ์ "note 1 รอข้อมูลจากลูกค้า"', "size": "xs", "color": "#666666", "margin": "sm"},
 
                     {"type": "separator", "margin": "lg"},
                     {"type": "text", "text": "🌅 เข้างาน / 📊 สรุป", "weight": "bold", "size": "sm", "color": "#1DB446", "margin": "lg"},
-                    {"type": "text", "text": 'พิมพ์ "เข้างาน" หรือ "สรุป"', "size": "xs", "color": "#666", "margin": "sm"},
+                    {"type": "text", "text": 'พิมพ์ "เข้างาน" หรือ "สรุป"', "size": "xs", "color": "#666666", "margin": "sm"},
 
                     {"type": "separator", "margin": "lg"},
-                    {"type": "text", "text": "⏰ auto สรุปทุกวัน 18:00 น.", "size": "xs", "color": "#999", "margin": "lg", "align": "center"},
-                    {"type": "text", "text": "ใช้ได้ทั้งแชทกลุ่มและส่วนตัว!", "size": "xs", "color": "#999", "margin": "sm", "align": "center"},
+                    {"type": "text", "text": "⏰ auto สรุปทุกวัน 18:00 น.", "size": "xs", "color": "#999999", "margin": "lg", "align": "center"},
+                    {"type": "text", "text": "ใช้ได้ทั้งแชทกลุ่มและส่วนตัว!", "size": "xs", "color": "#999999", "margin": "sm", "align": "center"},
                 ],
                 "paddingAll": "15px",
             },
