@@ -1,26 +1,20 @@
 """
 LINE Todo Bot - ระบบจัดการ To-Do List ผ่าน LINE Chat
-ฟีเจอร์:
-  - เพิ่มงาน: พิมพ์ "เพิ่ม <ชื่องาน>"
-  - ดูงานค้าง: พิมพ์ "งานค้าง" หรือ "ดูงาน"
-  - เสร็จงาน: พิมพ์ "เสร็จ <หมายเลข>" หรือ "done <หมายเลข>"
-  - เข้างาน: พิมพ์ "เข้างาน" → แสดงงานวันนี้อัตโนมัติ
-  - สรุปวัน: พิมพ์ "สรุป" หรือ auto สรุปตอนท้ายวัน
-  - ลบงาน: พิมพ์ "ลบ <หมายเลข>"
-  - ช่วยเหลือ: พิมพ์ "help" หรือ "วิธีใช้"
+ใช้ Flask + requests เท่านั้น (ไม่ใช้ line-bot-sdk)
 """
 
 import os
 import re
+import json
 import sqlite3
-from datetime import datetime, timedelta
+import hashlib
+import hmac
+import base64
+from datetime import datetime
 from contextlib import contextmanager
-from typing import Optional
 
+import requests
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ============================================================
@@ -30,22 +24,68 @@ app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_API_URL = "https://api.line.me/v2/bot"
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# เวลาสรุปรายวัน (24-hour format, Thailand timezone UTC+7)
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "18"))
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
-
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "todo.db")
+
+
+def line_headers():
+    return {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + LINE_CHANNEL_ACCESS_TOKEN,
+    }
+
+
+def verify_signature(body, signature):
+    """ตรวจสอบ signature จาก LINE."""
+    hash_val = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    expected = base64.b64encode(hash_val).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def reply_message(reply_token, text):
+    """ส่งข้อความตอบกลับ."""
+    url = LINE_API_URL + "/message/reply"
+    data = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}],
+    }
+    requests.post(url, headers=line_headers(), json=data)
+
+
+def push_message(to, text):
+    """ส่งข้อความแบบ push."""
+    url = LINE_API_URL + "/message/push"
+    data = {
+        "to": to,
+        "messages": [{"type": "text", "text": text}],
+    }
+    requests.post(url, headers=line_headers(), json=data)
+
+
+def get_profile(user_id):
+    """ดึงโปรไฟล์ผู้ใช้."""
+    try:
+        url = LINE_API_URL + "/profile/" + user_id
+        resp = requests.get(url, headers=line_headers())
+        if resp.status_code == 200:
+            return resp.json().get("displayName", "")
+    except Exception:
+        pass
+    return ""
+
 
 # ============================================================
 # Database
 # ============================================================
 @contextmanager
 def get_db():
-    """Context manager for database connections."""
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -56,7 +96,6 @@ def get_db():
 
 
 def init_db():
-    """สร้างตาราง database."""
     with get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
@@ -81,10 +120,9 @@ def init_db():
 
 
 # ============================================================
-# Task Management Functions
+# Task Management
 # ============================================================
 def add_task(chat_id, title, added_by="", due_date=None):
-    """เพิ่มงานใหม่."""
     with get_db() as conn:
         cursor = conn.execute(
             "INSERT INTO tasks (chat_id, title, added_by, due_date) VALUES (?, ?, ?, ?)",
@@ -95,7 +133,6 @@ def add_task(chat_id, title, added_by="", due_date=None):
 
 
 def get_pending_tasks(chat_id):
-    """ดึงงานที่ยังไม่เสร็จ."""
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE chat_id = ? AND status = 'pending' ORDER BY created_at ASC",
@@ -105,7 +142,6 @@ def get_pending_tasks(chat_id):
 
 
 def get_completed_today(chat_id):
-    """ดึงงานที่เสร็จวันนี้."""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db() as conn:
         rows = conn.execute(
@@ -116,7 +152,6 @@ def get_completed_today(chat_id):
 
 
 def complete_task(chat_id, task_number):
-    """ทำเครื่องหมายงานเสร็จ (ใช้ลำดับจาก pending list)."""
     pending = get_pending_tasks(chat_id)
     if 1 <= task_number <= len(pending):
         task = pending[task_number - 1]
@@ -130,7 +165,6 @@ def complete_task(chat_id, task_number):
 
 
 def delete_task(chat_id, task_number):
-    """ลบงาน (ใช้ลำดับจาก pending list)."""
     pending = get_pending_tasks(chat_id)
     if 1 <= task_number <= len(pending):
         task = pending[task_number - 1]
@@ -141,7 +175,6 @@ def delete_task(chat_id, task_number):
 
 
 def get_all_active_chats():
-    """ดึง chat_id ทั้งหมดที่มีงานค้าง."""
     with get_db() as conn:
         rows = conn.execute(
             "SELECT DISTINCT chat_id FROM tasks WHERE status = 'pending'"
@@ -150,7 +183,6 @@ def get_all_active_chats():
 
 
 def register_member(chat_id, user_id, display_name=""):
-    """บันทึกสมาชิกของแชท."""
     with get_db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO chat_members (chat_id, user_id, display_name) VALUES (?, ?, ?)",
@@ -162,7 +194,6 @@ def register_member(chat_id, user_id, display_name=""):
 # Message Builders
 # ============================================================
 def build_task_list_message(chat_id, header="📋 งานค้างทั้งหมด"):
-    """สร้างข้อความแสดงรายการงานค้าง."""
     pending = get_pending_tasks(chat_id)
     if not pending:
         return "🎉 ไม่มีงานค้าง! เยี่ยมไปเลย!"
@@ -179,7 +210,6 @@ def build_task_list_message(chat_id, header="📋 งานค้างทั้
 
 
 def build_clock_in_message(chat_id):
-    """สร้างข้อความตอน 'เข้างาน'."""
     now = datetime.now()
     pending = get_pending_tasks(chat_id)
 
@@ -201,7 +231,6 @@ def build_clock_in_message(chat_id):
 
 
 def build_daily_summary(chat_id):
-    """สร้างข้อความสรุปรายวัน."""
     now = datetime.now()
     completed = get_completed_today(chat_id)
     pending = get_pending_tasks(chat_id)
@@ -211,7 +240,6 @@ def build_daily_summary(chat_id):
         "═" * 25,
     ]
 
-    # งานที่เสร็จวันนี้
     lines.append("\n✅ งานที่เสร็จวันนี้ ({} งาน):".format(len(completed)))
     if completed:
         for task in completed:
@@ -219,7 +247,6 @@ def build_daily_summary(chat_id):
     else:
         lines.append("  — ยังไม่มีงานเสร็จวันนี้")
 
-    # งานที่ยังค้าง
     lines.append("\n⏳ งานที่ยังค้าง ({} งาน):".format(len(pending)))
     if pending:
         for i, task in enumerate(pending, 1):
@@ -227,7 +254,6 @@ def build_daily_summary(chat_id):
     else:
         lines.append("  — ไม่มีงานค้าง! 🎉")
 
-    # งานพรุ่งนี้ (= งานค้างที่ต้องทำต่อ)
     if pending:
         lines.append("\n📅 งานที่ต้องทำพรุ่งนี้:")
         for i, task in enumerate(pending, 1):
@@ -245,7 +271,6 @@ def build_daily_summary(chat_id):
 
 
 def build_help_message():
-    """สร้างข้อความวิธีใช้."""
     return """📖 วิธีใช้ Todo Bot
 ─────────────────
 📝 เพิ่มงาน:
@@ -277,73 +302,14 @@ def build_help_message():
 
 
 # ============================================================
-# LINE Webhook
+# Command Processing
 # ============================================================
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        app.logger.error("Invalid signature")
-        abort(400)
-    return "OK"
-
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    """จัดการข้อความที่เข้ามา."""
-    text = event.message.text.strip()
-
-    # ดึง chat_id (กลุ่ม หรือ ส่วนตัว)
-    source = event.source
-    if source.type == "group":
-        chat_id = source.group_id
-    elif source.type == "room":
-        chat_id = source.room_id
-    else:
-        chat_id = source.user_id
-
-    user_id = getattr(source, "user_id", "")
-    reply_token = event.reply_token
-
-    # ดึงชื่อผู้ส่ง (ถ้าทำได้)
-    display_name = get_display_name(user_id)
-    if display_name and chat_id != user_id:
-        register_member(chat_id, user_id, display_name)
-
-    reply_text = process_command(text, chat_id, display_name)
-
-    if reply_text:
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=reply_text)
-        )
-
-
-def get_display_name(user_id):
-    """ดึงชื่อผู้ใช้จาก LINE API."""
-    if not user_id:
-        return ""
-    try:
-        profile = line_bot_api.get_profile(user_id)
-        return profile.display_name
-    except Exception:
-        return ""
-
-
 def process_command(text, chat_id, display_name=""):
-    """ประมวลผลคำสั่ง."""
     text_lower = text.lower().strip()
 
-    # === เข้างาน ===
     if text_lower in ["เข้างาน", "clock in", "เริ่มงาน"]:
         return build_clock_in_message(chat_id)
 
-    # === เพิ่มงาน ===
     match_add = re.match(r"^(?:เพิ่ม|add|todo|งาน)\s+(.+)", text, re.IGNORECASE)
     if match_add:
         title = match_add.group(1).strip()
@@ -351,11 +317,9 @@ def process_command(text, chat_id, display_name=""):
         pending_count = len(get_pending_tasks(chat_id))
         return "✅ เพิ่มงานแล้ว!\n📝 {}\n📌 งานค้างทั้งหมด: {} งาน".format(task["title"], pending_count)
 
-    # === ดูงานค้าง ===
     if text_lower in ["งานค้าง", "ดูงาน", "list", "tasks", "รายการ", "ดู"]:
         return build_task_list_message(chat_id)
 
-    # === เสร็จงาน ===
     match_done = re.match(r"^(?:เสร็จ|done|✅)\s*(\d+)", text, re.IGNORECASE)
     if match_done:
         num = int(match_done.group(1))
@@ -365,7 +329,6 @@ def process_command(text, chat_id, display_name=""):
             return "✅ เสร็จแล้ว!\n✔️ {}\n📌 งานค้างเหลือ: {} งาน".format(task["title"], pending_count)
         return "❌ ไม่พบงานหมายเลข {}\nลองพิมพ์ 'งานค้าง' เพื่อดูรายการ".format(num)
 
-    # === ลบงาน ===
     match_delete = re.match(r"^(?:ลบ|delete|remove)\s*(\d+)", text, re.IGNORECASE)
     if match_delete:
         num = int(match_delete.group(1))
@@ -374,28 +337,70 @@ def process_command(text, chat_id, display_name=""):
             return "🗑️ ลบงานแล้ว: {}".format(task["title"])
         return "❌ ไม่พบงานหมายเลข {}".format(num)
 
-    # === สรุปรายวัน ===
     if text_lower in ["สรุป", "summary", "รายงาน", "report"]:
         return build_daily_summary(chat_id)
 
-    # === ช่วยเหลือ ===
     if text_lower in ["help", "วิธีใช้", "ช่วย", "คำสั่ง", "?", "เมนู", "menu"]:
         return build_help_message()
 
-    # ไม่ตรงกับคำสั่งใดเลย → ไม่ตอบ (เพื่อไม่รบกวนแชทกลุ่ม)
     return None
+
+
+# ============================================================
+# Webhook
+# ============================================================
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+
+    if not verify_signature(body, signature):
+        abort(400)
+
+    data = json.loads(body)
+    events = data.get("events", [])
+
+    for event in events:
+        if event.get("type") != "message":
+            continue
+        if event.get("message", {}).get("type") != "text":
+            continue
+
+        text = event["message"]["text"].strip()
+        reply_token = event["replyToken"]
+
+        source = event.get("source", {})
+        source_type = source.get("type", "")
+        if source_type == "group":
+            chat_id = source.get("groupId", "")
+        elif source_type == "room":
+            chat_id = source.get("roomId", "")
+        else:
+            chat_id = source.get("userId", "")
+
+        user_id = source.get("userId", "")
+        display_name = get_profile(user_id) if user_id else ""
+
+        if display_name and chat_id != user_id:
+            register_member(chat_id, user_id, display_name)
+
+        reply_text = process_command(text, chat_id, display_name)
+
+        if reply_text:
+            reply_message(reply_token, reply_text)
+
+    return "OK"
 
 
 # ============================================================
 # Scheduled Daily Summary
 # ============================================================
 def send_daily_summary():
-    """ส่งสรุปรายวันให้ทุก chat ที่มีงานค้าง."""
     chat_ids = get_all_active_chats()
     for chat_id in chat_ids:
         try:
             summary = build_daily_summary(chat_id)
-            line_bot_api.push_message(chat_id, TextSendMessage(text=summary))
+            push_message(chat_id, summary)
         except Exception as e:
             app.logger.error("Failed to send summary to {}: {}".format(chat_id, e))
 
@@ -413,7 +418,6 @@ def health():
 # ============================================================
 init_db()
 
-# ตั้ง scheduler สรุปรายวัน
 scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 scheduler.add_job(
     send_daily_summary,
