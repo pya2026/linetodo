@@ -11,7 +11,7 @@ from datetime import datetime
 from contextlib import contextmanager
 
 import requests
-from flask import Flask, request, abort, jsonify, render_template_string
+from flask import Flask, request, abort, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
@@ -19,6 +19,7 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LIFF_ID                   = os.environ.get("LIFF_ID", "")
+APP_URL                   = os.environ.get("APP_URL", "")
 LINE_API_URL              = "https://api.line.me/v2/bot"
 DAILY_SUMMARY_HOUR        = int(os.environ.get("DAILY_SUMMARY_HOUR", "18"))
 DAILY_SUMMARY_MINUTE      = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
@@ -190,13 +191,15 @@ def aqr(msg):
     if isinstance(msg, dict) and "quickReply" not in msg: msg["quickReply"] = qr()
     return msg
 
-def liff_url(tid):
-    return "https://liff.line.me/{}?task_id={}".format(LIFF_ID, tid) if LIFF_ID else None
+def task_page_url(tid):
+    if APP_URL: return APP_URL.rstrip("/")+"/liff/task?task_id={}".format(tid)
+    if LIFF_ID: return "https://liff.line.me/{}?task_id={}".format(LIFF_ID, tid)
+    return None
 
 # ── Flex Cards ───────────────────────────────────────────────
 def build_mini_card(task, idx):
     tid = task["id"]; cc = len(get_comments(tid)); by = task.get("added_by","") or "-"
-    lu = liff_url(tid)
+    lu = task_page_url(tid)
     if lu:
         # มี LIFF → ปุ่มเดียว เปิด LIFF จัดการทุกอย่างข้างใน
         footer_contents=[{"type":"button","action":{"type":"uri","label":"📖 เปิดดู / จัดการ","uri":lu},"style":"primary","height":"sm","color":"#1DB446"}]
@@ -273,7 +276,7 @@ def build_full_card(task):
                 except: pass
             body.append({"type":"text","text":"{} {} — {}".format(lt,l.get("user_name","?"),l.get("detail","")[:30]),"size":"xxs","color":"#AAAAAA","margin":"xs","wrap":True})
 
-    lu=liff_url(tid)
+    lu=task_page_url(tid)
     if lu:
         # มี LIFF → ปุ่มเดียว ทุกอย่างจัดการใน LIFF
         footer=[
@@ -308,7 +311,7 @@ def build_list_flex(cid):
     p=get_pending_tasks(cid)
     if not p: return aqr("🎉 ไม่มีงานค้าง!")
     if len(p)==1:
-        lu=liff_url(p[0]["id"])
+        lu=task_page_url(p[0]["id"])
         if lu: return aqr({"type":"flex","altText":"📋 งานค้าง 1 งาน","contents":build_mini_card(p[0],1)})
         return build_task_flex(p[0]["id"])
     return aqr({"type":"flex","altText":"📋 งานค้าง {} งาน".format(len(p)),"contents":{"type":"carousel","contents":[build_mini_card(t,i) for i,t in enumerate(p[:10],1)]}})
@@ -604,18 +607,19 @@ def api_log(tid):
     return jsonify(get_activity_log(tid, 50))
 
 # ══════════════════════════════════════════════════════════════
-# LIFF Page
+# Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
-LIFF_HTML = r"""<!DOCTYPE html>
+TASK_PAGE_HTML = """<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;">
 <title>Task Detail</title>
-<script charset="utf-8" src="https://static.line-sdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
 .loading{display:flex;justify-content:center;align-items:center;height:100vh;font-size:18px;color:#1DB446}
 .app{display:none;padding-bottom:70px}
+.namebox{background:#FFF3CD;padding:12px 16px;text-align:center;display:none}
+.namebox input{padding:8px 12px;border:2px solid #1DB446;border-radius:8px;font-size:15px;width:60%}
+.namebox button{padding:8px 16px;border:none;border-radius:8px;background:#1DB446;color:#fff;font-weight:bold;font-size:14px;margin-left:6px;cursor:pointer}
 .head{background:linear-gradient(135deg,#1DB446,#17a03d);color:#fff;padding:18px 16px;position:sticky;top:0;z-index:10}
 .head .idx{font-size:12px;opacity:.7}.head .title{font-size:19px;font-weight:bold;margin:5px 0;cursor:pointer}
 .head .title:hover{text-decoration:underline}.head .hint{font-size:10px;opacity:.5}
@@ -659,6 +663,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
 </div>
 <div class="app" id="app">
+  <div class="namebox" id="nameBox">
+    <input id="nameInput" placeholder="ชื่อของคุณ" onkeypress="if(event.key==='Enter')setName()">
+    <button onclick="setName()">OK</button>
+  </div>
   <div class="head">
     <div class="idx" id="tidx">#1 ⬜</div>
     <div class="title" id="ttitle" onclick="showEdit()">...</div>
@@ -679,77 +687,75 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="cbar"><input id="cinput" placeholder="พิมพ์ comment..." onkeypress="if(event.key==='Enter')sendCmt()"><button onclick="sendCmt()">➤</button></div>
 </div>
 <script>
-const LIFF_ID="{{liff_id}}",API="";let taskId,task,profile;
-function loadSDK(){
-  return new Promise(function(ok,fail){
-    if(typeof liff!=="undefined"){ok();return}
-    var s=document.createElement("script");s.charset="utf-8";
-    s.src="https://static.line-sdn.net/liff/edge/versions/2.22.3/sdk.js";
-    s.onload=ok;s.onerror=function(){fail(new Error("LIFF SDK load failed"))};
-    document.head.appendChild(s)});}
+const API="";let taskId,task,userName="";
 async function init(){
-  try{await loadSDK();await liff.init({liffId:LIFF_ID});if(!liff.isLoggedIn()){liff.login();return}
-  profile=await liff.getProfile();taskId=new URLSearchParams(location.search).get("task_id");
-  if(!taskId){document.getElementById("loading").textContent="❌ ไม่มี task_id";return}
-  await load();document.getElementById("loading").style.display="none";document.getElementById("app").style.display="block"}
-  catch(e){document.getElementById("loading").textContent="❌ "+e.message}}
+  var el=document.getElementById("loading");
+  taskId=new URLSearchParams(location.search).get("task_id");
+  if(!taskId){el.textContent="ไม่มี task_id";return}
+  try{await load();el.style.display="none";document.getElementById("app").style.display="block";
+  document.getElementById("nameBox").style.display="block"}
+  catch(e){el.textContent="โหลดไม่ได้: "+e.message}}
+function setName(){var v=document.getElementById("nameInput").value.trim();
+  if(!v){document.getElementById("nameInput").focus();return}
+  userName=v;document.getElementById("nameBox").style.display="none";toast("สวัสดี "+v+" !")}
+function getName(){
+  if(userName)return userName;
+  var v=prompt("กรุณาใส่ชื่อของคุณ:");
+  if(v&&v.trim()){userName=v.trim();return userName}
+  return ""}
 async function load(){
-  const r=await fetch(API+"/api/task/"+taskId);if(!r.ok)return;task=await r.json();render()}
+  const r=await fetch(API+"/api/task/"+taskId);if(!r.ok)throw new Error("Task not found");task=await r.json();render()}
 function render(){
   document.getElementById("tidx").textContent="#"+(task.index||task.id)+" "+(task.status==="pending"?"⬜":"✅");
   document.getElementById("ttitle").textContent=task.title;
   document.getElementById("tby").textContent="สั่งโดย: "+(task.added_by||"-");
-  let dt="";if(task.created_at){try{const d=new Date(task.created_at);dt=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
+  var dt="";if(task.created_at){try{var d=new Date(task.created_at);dt=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
   document.getElementById("tdate").textContent="เมื่อ: "+(dt||"-");
-  if(task.added_by_user_id&&task.added_by_user_id!==profile.userId){const b=document.getElementById("askBtn");b.style.display="flex";b.textContent="🙋 ถามคนสั่ง ("+(task.added_by||"?").substring(0,10)+")"}
+  var b=document.getElementById("askBtn");if(task.added_by_user_id){b.style.display="flex";b.textContent="🙋 ถามคนสั่ง ("+(task.added_by||"?").substring(0,10)+")"}
   renderComments();renderLog()}
 function renderComments(){
-  const el=document.getElementById("commentsTab"),c=task.comments||[];
+  var el=document.getElementById("commentsTab"),c=task.comments||[];
   if(!c.length){el.innerHTML='<div class="nocmt">ยังไม่มี comment<br>พิมพ์ด้านล่าง 👇</div>';return}
-  el.innerHTML=c.map(x=>{let t="";if(x.created_at){try{t=new Date(x.created_at).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
+  el.innerHTML=c.map(function(x){var t="";if(x.created_at){try{t=new Date(x.created_at).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
   return'<div class="cmt"><div class="ct"><span class="cn">'+esc(x.author||"?")+'</span><span class="ctm">'+(t||"-")+'</span></div><div class="cb">'+esc(x.content)+'</div></div>'}).join("")}
 function renderLog(){
-  const el=document.getElementById("logTab"),logs=task.logs||[];
+  var el=document.getElementById("logTab"),logs=task.logs||[];
   if(!logs.length){el.innerHTML='<div class="nocmt">ยังไม่มี activity log</div>';return}
-  const icons={"created":"🆕","edited":"✏️","commented":"💬","completed":"✅","deleted":"🗑️"};
-  el.innerHTML=logs.map(l=>{let t="";if(l.created_at){try{const d=new Date(l.created_at);t=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
+  var icons={"created":"🆕","edited":"✏️","commented":"💬","completed":"✅","deleted":"🗑️"};
+  el.innerHTML=logs.map(function(l){var t="";if(l.created_at){try{var d=new Date(l.created_at);t=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
   return'<div class="log-item"><div class="log-icon">'+(icons[l.action]||"📌")+'</div><div class="log-body"><div class="log-user">'+esc(l.user_name||"?")+'</div><div class="log-detail">'+esc(l.detail||"")+'</div></div><div class="log-time">'+(t||"-")+'</div></div>'}).join("")}
 function showTab(tab){
-  document.querySelectorAll(".tab").forEach((t,i)=>t.classList.toggle("active",i===(tab==="comments"?0:1)));
+  document.querySelectorAll(".tab").forEach(function(t,i){t.classList.toggle("active",i===(tab==="comments"?0:1))});
   document.getElementById("commentsTab").style.display=tab==="comments"?"block":"none";
   document.getElementById("logTab").style.display=tab==="log"?"block":"none"}
-function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
+function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML}
 function showEdit(){document.getElementById("einput").value=task.title;document.getElementById("ebox").style.display="block";document.getElementById("einput").focus()}
 function hideEdit(){document.getElementById("ebox").style.display="none"}
-async function saveEdit(){const v=document.getElementById("einput").value.trim();if(!v)return;
-  await fetch(API+"/api/task/"+taskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:v,author:profile.displayName,author_uid:profile.userId})});
+async function saveEdit(){var n=getName();if(!n)return;var v=document.getElementById("einput").value.trim();if(!v)return;
+  await fetch(API+"/api/task/"+taskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:v,author:n,author_uid:""})});
   await load();hideEdit();toast("✏️ แก้ไขแล้ว!")}
-async function sendCmt(){const inp=document.getElementById("cinput"),v=inp.value.trim();if(!v)return;inp.value="";
-  await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:profile.displayName,author_uid:profile.userId})});
+async function sendCmt(){var n=getName();if(!n)return;var inp=document.getElementById("cinput"),v=inp.value.trim();if(!v)return;inp.value="";
+  await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:n,author_uid:""})});
   await load();toast("💬 เพิ่ม comment แล้ว!")}
-function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async()=>{
-  await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:profile.displayName,author_uid:profile.userId})});
-  toast("✅ เสร็จแล้ว!");setTimeout(()=>{if(liff.isInClient())liff.closeWindow();else location.reload()},1000)})}
-function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async()=>{
-  await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:profile.displayName,author_uid:profile.userId})});
-  toast("🗑️ ลบแล้ว!");setTimeout(()=>{if(liff.isInClient())liff.closeWindow();else location.reload()},1000)})}
+function confirmDone(){var n=getName();if(!n)return;showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
+  await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:n,author_uid:""})});
+  toast("✅ เสร็จแล้ว!");setTimeout(function(){location.reload()},1000)})}
+function confirmDelete(){var n=getName();if(!n)return;showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
+  await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:n,author_uid:""})});
+  toast("🗑️ ลบแล้ว!");setTimeout(function(){location.reload()},1000)})}
 async function askOwner(){
-  const r=await fetch(API+"/api/task/"+taskId+"/ask-owner",{method:"POST"});
-  if(r.ok){toast("🙋 tag คนสั่งแล้ว!");setTimeout(()=>{if(liff.isInClient())liff.closeWindow()},1500)}else toast("❌ ไม่สามารถ tag ได้")}
+  var r=await fetch(API+"/api/task/"+taskId+"/ask-owner",{method:"POST"});
+  if(r.ok){toast("🙋 tag คนสั่งแล้ว!")}else toast("ไม่สามารถ tag ได้")}
 function showConfirm(title,msg,onYes){document.getElementById("confirmTitle").textContent=title;document.getElementById("confirmMsg").textContent=msg;
-  document.getElementById("confirmYes").onclick=()=>{hideConfirm();onYes()};document.getElementById("confirmOverlay").style.display="flex"}
+  document.getElementById("confirmYes").onclick=function(){hideConfirm();onYes()};document.getElementById("confirmOverlay").style.display="flex"}
 function hideConfirm(){document.getElementById("confirmOverlay").style.display="none"}
-function toast(m){const t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(()=>t.style.display="none",2500)}
+function toast(m){var t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(function(){t.style.display="none"},2500)}
 init();
 </script></body></html>"""
 
 @app.route("/liff/task")
-def liff_page():
-    from flask import make_response
-    resp = make_response(render_template_string(LIFF_HTML, liff_id=LIFF_ID))
-    resp.headers["Content-Security-Policy"] = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *; img-src * data:; style-src * 'unsafe-inline'"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    return resp
+def task_page():
+    return TASK_PAGE_HTML
 
 # ── Scheduled Summary ────────────────────────────────────────
 def send_daily():
