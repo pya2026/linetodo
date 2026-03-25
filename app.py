@@ -391,7 +391,7 @@ def build_help():
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","help","วิธีใช้","เมนู","menu"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -458,7 +458,7 @@ def process_text(text, cid, uid="", name=""):
         if t: add_comment(t["id"],cid,name,uid,m.group(2).strip()); return build_task_flex(t["id"])
         return aqr("❌ ไม่พบงาน #{}".format(ref))
     if tl in ["สรุป","summary","รายงาน","report"]: return build_summary(cid)
-    if tl in ["help","วิธีใช้","ช่วย","คำสั่ง","?","เมนู","menu"]: return build_help()
+    if tl in ["งานงาน","วิธีใช้","ช่วย","คำสั่ง","?","เมนู","menu"]: return build_help()
     return None
 
 # ── Postback ─────────────────────────────────────────────────
@@ -609,7 +609,7 @@ def api_log(tid):
 LIFF_HTML = r"""<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Task Detail</title>
-<script src="https://static.line-sdn.net/liff/edge/2/sdk.js"></script>
+<script charset="utf-8" src="https://static.line-sdn.net/liff/edge/2/sdk.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
@@ -679,8 +679,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </div>
 <script>
 const LIFF_ID="{{liff_id}}",API="";let taskId,task,profile;
+function loadSDK(){
+  return new Promise(function(ok,fail){
+    if(typeof liff!=="undefined"){ok();return}
+    var s=document.createElement("script");s.charset="utf-8";
+    s.src="https://static.line-sdn.net/liff/edge/2/sdk.js";
+    s.onload=ok;s.onerror=function(){fail(new Error("LIFF SDK load failed"))};
+    document.head.appendChild(s)});}
 async function init(){
-  try{await liff.init({liffId:LIFF_ID});if(!liff.isLoggedIn()){liff.login();return}
+  try{await loadSDK();await liff.init({liffId:LIFF_ID});if(!liff.isLoggedIn()){liff.login();return}
   profile=await liff.getProfile();taskId=new URLSearchParams(location.search).get("task_id");
   if(!taskId){document.getElementById("loading").textContent="❌ ไม่มี task_id";return}
   await load();document.getElementById("loading").style.display="none";document.getElementById("app").style.display="block"}
