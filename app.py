@@ -608,8 +608,9 @@ def api_log(tid):
 # ══════════════════════════════════════════════════════════════
 LIFF_HTML = r"""<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *;">
 <title>Task Detail</title>
-<script charset="utf-8" src="https://static.line-sdn.net/liff/edge/2/sdk.js"></script>
+<script charset="utf-8" src="https://static.line-sdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
@@ -683,7 +684,7 @@ function loadSDK(){
   return new Promise(function(ok,fail){
     if(typeof liff!=="undefined"){ok();return}
     var s=document.createElement("script");s.charset="utf-8";
-    s.src="https://static.line-sdn.net/liff/edge/2/sdk.js";
+    s.src="https://static.line-sdn.net/liff/edge/versions/2.22.3/sdk.js";
     s.onload=ok;s.onerror=function(){fail(new Error("LIFF SDK load failed"))};
     document.head.appendChild(s)});}
 async function init(){
@@ -744,7 +745,11 @@ init();
 
 @app.route("/liff/task")
 def liff_page():
-    return render_template_string(LIFF_HTML, liff_id=LIFF_ID)
+    from flask import make_response
+    resp = make_response(render_template_string(LIFF_HTML, liff_id=LIFF_ID))
+    resp.headers["Content-Security-Policy"] = "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *; img-src * data:; style-src * 'unsafe-inline'"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
 
 # ── Scheduled Summary ────────────────────────────────────────
 def send_daily():
