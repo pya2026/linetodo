@@ -197,20 +197,36 @@ def liff_url(tid):
 def build_mini_card(task, idx):
     tid = task["id"]; cc = len(get_comments(tid)); by = task.get("added_by","") or "-"
     lu = liff_url(tid)
-    ob = {"type":"button","action":{"type":"uri","label":"📖 เปิดดู","uri":lu},"style":"primary","height":"sm","color":"#1DB446"} if lu else \
-         {"type":"button","action":{"type":"postback","label":"📖 เปิดดู","data":"action=view_task&task_id={}".format(tid)},"style":"primary","height":"sm","color":"#1DB446"}
+    if lu:
+        # มี LIFF → ปุ่มเดียว เปิด LIFF จัดการทุกอย่างข้างใน
+        footer_contents=[{"type":"button","action":{"type":"uri","label":"📖 เปิดดู / จัดการ","uri":lu},"style":"primary","height":"sm","color":"#1DB446"}]
+    else:
+        footer_contents=[
+            {"type":"button","action":{"type":"postback","label":"📖 เปิดดู","data":"action=view_task&task_id={}".format(tid)},"style":"primary","height":"sm","color":"#1DB446"},
+            {"type":"button","action":{"type":"postback","label":"✅ เสร็จ","data":"action=done&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]
+    # แสดง comment ล่าสุดถ้ามี
+    comments=get_comments(tid)
+    body_contents=[
+        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
+        {"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"}]
+    if comments:
+        c=comments[-1]; ts=""
+        if c.get("created_at"):
+            try: ts=datetime.fromisoformat(c["created_at"]).strftime("%H:%M")
+            except: pass
+        body_contents.append({"type":"box","layout":"vertical","contents":[
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":c.get("author","") or "?","size":"xxs","color":"#1DB446","weight":"bold","flex":4},
+                {"type":"text","text":ts or "-","size":"xxs","color":"#AAAAAA","flex":1,"align":"end"}]},
+            {"type":"text","text":c["content"],"size":"xs","color":"#333333","wrap":True,"margin":"xs"}
+        ],"margin":"sm","paddingAll":"6px","backgroundColor":"#F8F8F8","cornerRadius":"6px"})
     return {"type":"bubble","size":"kilo",
         "header":{"type":"box","layout":"horizontal","contents":[
             {"type":"text","text":"#{} ⬜".format(idx),"weight":"bold","color":"#1DB446","size":"sm","flex":0},
             {"type":"text","text":task["title"],"weight":"bold","size":"sm","wrap":True,"flex":5,"margin":"sm"},
         ],"paddingAll":"12px","backgroundColor":"#F5FFF5"},
-        "body":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
-            {"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"},
-        ],"paddingAll":"10px"},
-        "footer":{"type":"box","layout":"horizontal","contents":[ob,
-            {"type":"button","action":{"type":"postback","label":"✅ เสร็จ","data":"action=done&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"},
-        ],"paddingAll":"10px"}}
+        "body":{"type":"box","layout":"vertical","contents":body_contents,"paddingAll":"10px"},
+        "footer":{"type":"box","layout":"horizontal","contents":footer_contents,"paddingAll":"10px"}}
 
 def build_full_card(task):
     tid=task["id"];cid=task["chat_id"];idx=get_task_index(cid,tid);by=task.get("added_by","") or "ไม่ระบุ"
@@ -257,18 +273,22 @@ def build_full_card(task):
                 except: pass
             body.append({"type":"text","text":"{} {} — {}".format(lt,l.get("user_name","?"),l.get("detail","")[:30]),"size":"xxs","color":"#AAAAAA","margin":"xs","wrap":True})
 
-    footer=[
-        {"type":"box","layout":"horizontal","contents":[
-            {"type":"button","action":{"type":"postback","label":"✅ เสร็จแล้ว","data":"action=confirm_done&task_id={}".format(tid)},"style":"primary","height":"sm","color":"#1DB446"},
-            {"type":"button","action":{"type":"postback","label":"✏️ แก้ไข","data":"action=edit_prompt&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]},
-        {"type":"box","layout":"horizontal","contents":[
-            {"type":"button","action":{"type":"postback","label":"💬 Comment","data":"action=comment_prompt&task_id={}".format(tid)},"style":"secondary","height":"sm"},
-            {"type":"button","action":{"type":"postback","label":"🗑️ ลบ","data":"action=confirm_delete&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}],"margin":"sm"}]
-    if task.get("added_by_user_id"):
-        footer.append({"type":"button","action":{"type":"postback","label":"🙋 ถามคนสั่ง ({})".format(by[:8]),"data":"action=ask_owner&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"})
     lu=liff_url(tid)
     if lu:
-        footer.append({"type":"button","action":{"type":"uri","label":"📖 เปิดหน้าจัดการเต็ม","uri":lu},"style":"primary","height":"sm","color":"#0D8ABC","margin":"sm"})
+        # มี LIFF → ปุ่มเดียว ทุกอย่างจัดการใน LIFF
+        footer=[
+            {"type":"button","action":{"type":"uri","label":"📖 เปิดจัดการ (แก้ไข / comment / เสร็จ / ลบ)","uri":lu},"style":"primary","height":"sm","color":"#1DB446"}]
+    else:
+        # ไม่มี LIFF → fallback ปุ่มเยอะในแชท
+        footer=[
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"button","action":{"type":"postback","label":"✅ เสร็จแล้ว","data":"action=confirm_done&task_id={}".format(tid)},"style":"primary","height":"sm","color":"#1DB446"},
+                {"type":"button","action":{"type":"postback","label":"✏️ แก้ไข","data":"action=edit_prompt&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]},
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"button","action":{"type":"postback","label":"💬 Comment","data":"action=comment_prompt&task_id={}".format(tid)},"style":"secondary","height":"sm"},
+                {"type":"button","action":{"type":"postback","label":"🗑️ ลบ","data":"action=confirm_delete&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}],"margin":"sm"}]
+        if task.get("added_by_user_id"):
+            footer.append({"type":"button","action":{"type":"postback","label":"🙋 ถามคนสั่ง ({})".format(by[:8]),"data":"action=ask_owner&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"})
 
     return {"type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","contents":[
@@ -569,12 +589,6 @@ def api_comment(tid):
     d=request.get_json() or {}; t=get_task(tid)
     if not t: return jsonify({"error":"not found"}),404
     add_comment(tid,t["chat_id"],d.get("author",""),d.get("author_uid",""),d.get("content",""))
-    # push Flex card แจ้งในแชทอัตโนมัติเมื่อมีคอมเม้นใหม่
-    try:
-        updated=get_task(tid)
-        if updated:
-            push_msg(t["chat_id"],aqr({"type":"flex","altText":"💬 {} comment ใน: {}".format(d.get("author",""),t["title"]),"contents":build_full_card(updated)}))
-    except Exception as e: app.logger.error("Push comment card err: %s",e)
     return jsonify({"ok":True,"comments":get_comments(tid)})
 
 @app.route("/api/task/<int:tid>/ask-owner",methods=["POST"])
