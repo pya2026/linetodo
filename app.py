@@ -15,19 +15,12 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+from typing import Optional
 
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    PushMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ============================================================
@@ -38,7 +31,7 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # เวลาสรุปรายวัน (24-hour format, Thailand timezone UTC+7)
@@ -90,7 +83,7 @@ def init_db():
 # ============================================================
 # Task Management Functions
 # ============================================================
-def add_task(chat_id: str, title: str, added_by: str = "", due_date: str = None) -> dict:
+def add_task(chat_id, title, added_by="", due_date=None):
     """เพิ่มงานใหม่."""
     with get_db() as conn:
         cursor = conn.execute(
@@ -101,7 +94,7 @@ def add_task(chat_id: str, title: str, added_by: str = "", due_date: str = None)
     return {"id": task_id, "title": title.strip()}
 
 
-def get_pending_tasks(chat_id: str) -> list:
+def get_pending_tasks(chat_id):
     """ดึงงานที่ยังไม่เสร็จ."""
     with get_db() as conn:
         rows = conn.execute(
@@ -111,7 +104,7 @@ def get_pending_tasks(chat_id: str) -> list:
     return [dict(r) for r in rows]
 
 
-def get_completed_today(chat_id: str) -> list:
+def get_completed_today(chat_id):
     """ดึงงานที่เสร็จวันนี้."""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db() as conn:
@@ -122,7 +115,7 @@ def get_completed_today(chat_id: str) -> list:
     return [dict(r) for r in rows]
 
 
-def complete_task(chat_id: str, task_number: int) -> dict | None:
+def complete_task(chat_id, task_number):
     """ทำเครื่องหมายงานเสร็จ (ใช้ลำดับจาก pending list)."""
     pending = get_pending_tasks(chat_id)
     if 1 <= task_number <= len(pending):
@@ -136,7 +129,7 @@ def complete_task(chat_id: str, task_number: int) -> dict | None:
     return None
 
 
-def delete_task(chat_id: str, task_number: int) -> dict | None:
+def delete_task(chat_id, task_number):
     """ลบงาน (ใช้ลำดับจาก pending list)."""
     pending = get_pending_tasks(chat_id)
     if 1 <= task_number <= len(pending):
@@ -147,7 +140,7 @@ def delete_task(chat_id: str, task_number: int) -> dict | None:
     return None
 
 
-def get_all_active_chats() -> list:
+def get_all_active_chats():
     """ดึง chat_id ทั้งหมดที่มีงานค้าง."""
     with get_db() as conn:
         rows = conn.execute(
@@ -156,7 +149,7 @@ def get_all_active_chats() -> list:
     return [r["chat_id"] for r in rows]
 
 
-def register_member(chat_id: str, user_id: str, display_name: str = ""):
+def register_member(chat_id, user_id, display_name=""):
     """บันทึกสมาชิกของแชท."""
     with get_db() as conn:
         conn.execute(
@@ -168,7 +161,7 @@ def register_member(chat_id: str, user_id: str, display_name: str = ""):
 # ============================================================
 # Message Builders
 # ============================================================
-def build_task_list_message(chat_id: str, header: str = "📋 งานค้างทั้งหมด") -> str:
+def build_task_list_message(chat_id, header="📋 งานค้างทั้งหมด"):
     """สร้างข้อความแสดงรายการงานค้าง."""
     pending = get_pending_tasks(chat_id)
     if not pending:
@@ -176,30 +169,30 @@ def build_task_list_message(chat_id: str, header: str = "📋 งานค้า
 
     lines = [header, "─" * 20]
     for i, task in enumerate(pending, 1):
-        added = f" (โดย {task['added_by']})" if task["added_by"] else ""
+        added = " (โดย {})".format(task["added_by"]) if task["added_by"] else ""
         due = ""
         if task["due_date"]:
-            due = f" 📅 {task['due_date']}"
-        lines.append(f"{i}. ⬜ {task['title']}{added}{due}")
-    lines.append(f"\n📌 รวม {len(pending)} งานค้าง")
+            due = " 📅 {}".format(task["due_date"])
+        lines.append("{}. ⬜ {}{}{}".format(i, task["title"], added, due))
+    lines.append("\n📌 รวม {} งานค้าง".format(len(pending)))
     return "\n".join(lines)
 
 
-def build_clock_in_message(chat_id: str) -> str:
+def build_clock_in_message(chat_id):
     """สร้างข้อความตอน 'เข้างาน'."""
     now = datetime.now()
     pending = get_pending_tasks(chat_id)
 
     lines = [
-        f"🌅 สวัสดีตอนเช้า!",
-        f"📅 วันที่ {now.strftime('%d/%m/%Y')} เวลา {now.strftime('%H:%M')} น.",
+        "🌅 สวัสดีตอนเช้า!",
+        "📅 วันที่ {} เวลา {} น.".format(now.strftime("%d/%m/%Y"), now.strftime("%H:%M")),
         "─" * 20,
     ]
 
     if pending:
-        lines.append(f"📋 งานที่ต้องทำวันนี้ ({len(pending)} งาน):")
+        lines.append("📋 งานที่ต้องทำวันนี้ ({} งาน):".format(len(pending)))
         for i, task in enumerate(pending, 1):
-            lines.append(f"  {i}. ⬜ {task['title']}")
+            lines.append("  {}. ⬜ {}".format(i, task["title"]))
         lines.append("\n💪 สู้ๆ นะครับ! ทำงานให้เสร็จกันเยอะๆ")
     else:
         lines.append("🎉 ไม่มีงานค้าง! วันนี้เริ่มต้นด้วยความสดใส")
@@ -207,51 +200,51 @@ def build_clock_in_message(chat_id: str) -> str:
     return "\n".join(lines)
 
 
-def build_daily_summary(chat_id: str) -> str:
+def build_daily_summary(chat_id):
     """สร้างข้อความสรุปรายวัน."""
     now = datetime.now()
     completed = get_completed_today(chat_id)
     pending = get_pending_tasks(chat_id)
 
     lines = [
-        f"📊 สรุปประจำวัน - {now.strftime('%d/%m/%Y')}",
+        "📊 สรุปประจำวัน - {}".format(now.strftime("%d/%m/%Y")),
         "═" * 25,
     ]
 
     # งานที่เสร็จวันนี้
-    lines.append(f"\n✅ งานที่เสร็จวันนี้ ({len(completed)} งาน):")
+    lines.append("\n✅ งานที่เสร็จวันนี้ ({} งาน):".format(len(completed)))
     if completed:
         for task in completed:
-            lines.append(f"  ✔️ {task['title']}")
+            lines.append("  ✔️ {}".format(task["title"]))
     else:
         lines.append("  — ยังไม่มีงานเสร็จวันนี้")
 
     # งานที่ยังค้าง
-    lines.append(f"\n⏳ งานที่ยังค้าง ({len(pending)} งาน):")
+    lines.append("\n⏳ งานที่ยังค้าง ({} งาน):".format(len(pending)))
     if pending:
         for i, task in enumerate(pending, 1):
-            lines.append(f"  {i}. ⬜ {task['title']}")
+            lines.append("  {}. ⬜ {}".format(i, task["title"]))
     else:
         lines.append("  — ไม่มีงานค้าง! 🎉")
 
     # งานพรุ่งนี้ (= งานค้างที่ต้องทำต่อ)
     if pending:
-        lines.append(f"\n📅 งานที่ต้องทำพรุ่งนี้:")
+        lines.append("\n📅 งานที่ต้องทำพรุ่งนี้:")
         for i, task in enumerate(pending, 1):
-            lines.append(f"  {i}. ➡️ {task['title']}")
+            lines.append("  {}. ➡️ {}".format(i, task["title"]))
 
-    lines.append(f"\n{'─' * 25}")
+    lines.append("\n{}".format("─" * 25))
     if len(completed) > 0 and len(pending) == 0:
         lines.append("🏆 ยอดเยี่ยม! ทำงานเสร็จหมดวันนี้!")
     elif len(completed) > 0:
-        lines.append(f"👍 ทำได้ดีมาก! เสร็จไป {len(completed)} งาน")
+        lines.append("👍 ทำได้ดีมาก! เสร็จไป {} งาน".format(len(completed)))
     else:
         lines.append("💪 พรุ่งนี้มาสู้ใหม่กันนะ!")
 
     return "\n".join(lines)
 
 
-def build_help_message() -> str:
+def build_help_message():
     """สร้างข้อความวิธีใช้."""
     return """📖 วิธีใช้ Todo Bot
 ─────────────────
@@ -300,12 +293,21 @@ def callback():
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     """จัดการข้อความที่เข้ามา."""
     text = event.message.text.strip()
-    chat_id = event.source.group_id if hasattr(event.source, "group_id") and event.source.group_id else event.source.user_id
-    user_id = event.source.user_id if hasattr(event.source, "user_id") else ""
+
+    # ดึง chat_id (กลุ่ม หรือ ส่วนตัว)
+    source = event.source
+    if source.type == "group":
+        chat_id = source.group_id
+    elif source.type == "room":
+        chat_id = source.room_id
+    else:
+        chat_id = source.user_id
+
+    user_id = getattr(source, "user_id", "")
     reply_token = event.reply_token
 
     # ดึงชื่อผู้ส่ง (ถ้าทำได้)
@@ -316,30 +318,24 @@ def handle_message(event):
     reply_text = process_command(text, chat_id, display_name)
 
     if reply_text:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=reply_text)],
-                )
-            )
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=reply_text)
+        )
 
 
-def get_display_name(user_id: str) -> str:
+def get_display_name(user_id):
     """ดึงชื่อผู้ใช้จาก LINE API."""
     if not user_id:
         return ""
     try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            profile = line_bot_api.get_profile(user_id)
-            return profile.display_name
+        profile = line_bot_api.get_profile(user_id)
+        return profile.display_name
     except Exception:
         return ""
 
 
-def process_command(text: str, chat_id: str, display_name: str = "") -> str | None:
+def process_command(text, chat_id, display_name=""):
     """ประมวลผลคำสั่ง."""
     text_lower = text.lower().strip()
 
@@ -353,7 +349,7 @@ def process_command(text: str, chat_id: str, display_name: str = "") -> str | No
         title = match_add.group(1).strip()
         task = add_task(chat_id, title, added_by=display_name)
         pending_count = len(get_pending_tasks(chat_id))
-        return f"✅ เพิ่มงานแล้ว!\n📝 {task['title']}\n📌 งานค้างทั้งหมด: {pending_count} งาน"
+        return "✅ เพิ่มงานแล้ว!\n📝 {}\n📌 งานค้างทั้งหมด: {} งาน".format(task["title"], pending_count)
 
     # === ดูงานค้าง ===
     if text_lower in ["งานค้าง", "ดูงาน", "list", "tasks", "รายการ", "ดู"]:
@@ -366,8 +362,8 @@ def process_command(text: str, chat_id: str, display_name: str = "") -> str | No
         task = complete_task(chat_id, num)
         if task:
             pending_count = len(get_pending_tasks(chat_id))
-            return f"✅ เสร็จแล้ว!\n✔️ {task['title']}\n📌 งานค้างเหลือ: {pending_count} งาน"
-        return f"❌ ไม่พบงานหมายเลข {num}\nลองพิมพ์ 'งานค้าง' เพื่อดูรายการ"
+            return "✅ เสร็จแล้ว!\n✔️ {}\n📌 งานค้างเหลือ: {} งาน".format(task["title"], pending_count)
+        return "❌ ไม่พบงานหมายเลข {}\nลองพิมพ์ 'งานค้าง' เพื่อดูรายการ".format(num)
 
     # === ลบงาน ===
     match_delete = re.match(r"^(?:ลบ|delete|remove)\s*(\d+)", text, re.IGNORECASE)
@@ -375,8 +371,8 @@ def process_command(text: str, chat_id: str, display_name: str = "") -> str | No
         num = int(match_delete.group(1))
         task = delete_task(chat_id, num)
         if task:
-            return f"🗑️ ลบงานแล้ว: {task['title']}"
-        return f"❌ ไม่พบงานหมายเลข {num}"
+            return "🗑️ ลบงานแล้ว: {}".format(task["title"])
+        return "❌ ไม่พบงานหมายเลข {}".format(num)
 
     # === สรุปรายวัน ===
     if text_lower in ["สรุป", "summary", "รายงาน", "report"]:
@@ -396,19 +392,12 @@ def process_command(text: str, chat_id: str, display_name: str = "") -> str | No
 def send_daily_summary():
     """ส่งสรุปรายวันให้ทุก chat ที่มีงานค้าง."""
     chat_ids = get_all_active_chats()
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        for chat_id in chat_ids:
-            try:
-                summary = build_daily_summary(chat_id)
-                line_bot_api.push_message(
-                    PushMessageRequest(
-                        to=chat_id,
-                        messages=[TextMessage(text=summary)],
-                    )
-                )
-            except Exception as e:
-                app.logger.error(f"Failed to send summary to {chat_id}: {e}")
+    for chat_id in chat_ids:
+        try:
+            summary = build_daily_summary(chat_id)
+            line_bot_api.push_message(chat_id, TextSendMessage(text=summary))
+        except Exception as e:
+            app.logger.error("Failed to send summary to {}: {}".format(chat_id, e))
 
 
 # ============================================================
@@ -422,18 +411,18 @@ def health():
 # ============================================================
 # Main
 # ============================================================
+init_db()
+
+# ตั้ง scheduler สรุปรายวัน
+scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
+scheduler.add_job(
+    send_daily_summary,
+    "cron",
+    hour=DAILY_SUMMARY_HOUR,
+    minute=DAILY_SUMMARY_MINUTE,
+)
+scheduler.start()
+
 if __name__ == "__main__":
-    init_db()
-
-    # ตั้ง scheduler สรุปรายวัน
-    scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
-    scheduler.add_job(
-        send_daily_summary,
-        "cron",
-        hour=DAILY_SUMMARY_HOUR,
-        minute=DAILY_SUMMARY_MINUTE,
-    )
-    scheduler.start()
-
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
