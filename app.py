@@ -777,8 +777,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 var API="",taskId,task,userName="",members=[];
 async function init(){
   var el=document.getElementById("loading");
-  taskId=new URLSearchParams(location.search).get("task_id");
-  userName=decodeURIComponent(new URLSearchParams(location.search).get("name")||"");
+  var sp=new URLSearchParams(location.search);
+  taskId=sp.get("task_id");
+  if(!taskId){var ls=sp.get("liff.state");if(ls){var lp=new URLSearchParams(ls.replace(/^\?/,""));taskId=lp.get("task_id")}}
+  userName=decodeURIComponent(sp.get("name")||"");
   if(!taskId){el.textContent="ไม่มี task_id";return}
   try{
     await load();
