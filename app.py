@@ -128,32 +128,38 @@ def get_completed_today(cid):
             (cid,datetime.now().strftime("%Y-%m-%d"))).fetchall()]
 
 def complete_task(tid, by_name="", by_uid=""):
+    result = None
     with get_db() as c:
         r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r and r["status"]=="pending":
             c.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?",(datetime.now().isoformat(),tid))
-            log_activity(tid, r["chat_id"], by_name, by_uid, "completed", "ทำเสร็จ: {}".format(r["title"]))
-            return dict(r)
-    return None
+            result = dict(r)
+    if result:
+        log_activity(tid, result["chat_id"], by_name, by_uid, "completed", "ทำเสร็จ: {}".format(result["title"]))
+    return result
 
 def edit_task(tid, new_title, by_name="", by_uid=""):
+    result = None
     with get_db() as c:
         r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
             c.execute("UPDATE tasks SET title=? WHERE id=?",(new_title.strip(),tid))
-            log_activity(tid, r["chat_id"], by_name, by_uid, "edited", "แก้ไข: {} → {}".format(r["title"], new_title.strip()))
-            return {"id":tid,"old":r["title"],"new":new_title.strip()}
-    return None
+            result = {"id":tid,"old":r["title"],"new":new_title.strip(),"chat_id":r["chat_id"]}
+    if result:
+        log_activity(tid, result["chat_id"], by_name, by_uid, "edited", "แก้ไข: {} → {}".format(result["old"], result["new"]))
+    return result
 
 def delete_task(tid, by_name="", by_uid=""):
+    result = None
     with get_db() as c:
         r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
-            log_activity(tid, r["chat_id"], by_name, by_uid, "deleted", "ลบงาน: {}".format(r["title"]))
+            result = dict(r)
             c.execute("DELETE FROM comments WHERE task_id=?",(tid,))
             c.execute("DELETE FROM tasks WHERE id=?",(tid,))
-            return dict(r)
-    return None
+    if result:
+        log_activity(tid, result["chat_id"], by_name, by_uid, "deleted", "ลบงาน: {}".format(result["title"]))
+    return result
 
 def get_active_chats():
     with get_db() as c:
@@ -815,10 +821,10 @@ async function sendCmt(){var inp=document.getElementById("cinput"),v=inp.value.t
   await load();toast("💬 เพิ่ม comment แล้ว!")}
 function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
   var r=await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  if(r.ok){toast("✅ เสร็จแล้ว!");await load()}else{toast("ทำไม่ได้ ลองใหม่")}})}
+  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">✅</div><div style="font-size:18px;font-weight:bold;color:#43A047;margin-top:12px">เสร็จแล้ว!</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังปิดหน้านี้...</div></div>';setTimeout(function(){try{window.close()}catch(e){}},1500)}else{toast("ทำไม่ได้ ลองใหม่")}})}
 function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
   var r=await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  if(r.ok){toast("🗑️ ลบแล้ว!");document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">🗑️</div><div style="font-size:18px;font-weight:bold;color:#E53935;margin-top:12px">ลบงานแล้ว</div><div style="font-size:13px;color:#999;margin-top:6px">ปิดหน้านี้ได้เลย</div></div>'}
+  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">🗑️</div><div style="font-size:18px;font-weight:bold;color:#E53935;margin-top:12px">ลบงานแล้ว</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังปิดหน้านี้...</div></div>';setTimeout(function(){try{window.close()}catch(e){}},1500)}
   else{toast("ลบไม่ได้ ลองใหม่")}})}
 async function uploadImg(input){
   if(!input.files||!input.files[0])return;
