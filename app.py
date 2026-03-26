@@ -320,13 +320,13 @@ def build_list_flex(cid):
 def build_summary(cid):
     now=datetime.now(); done=get_completed_today(cid); pend=get_pending_tasks(cid)
     di=[{"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True} for t in done] or [{"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"}]
-    # pending items with done+delete buttons per row
+    # pending items with done+delete buttons — direct action, no confirm
     pi=[]
     for i,t in enumerate(pend,1):
         pi.append({"type":"box","layout":"horizontal","contents":[
-            {"type":"button","action":{"type":"postback","label":"☑️","data":"action=confirm_done&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center"},
+            {"type":"button","action":{"type":"postback","label":"☑️","data":"action=done_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center"},
             {"type":"text","text":"{}. {}".format(i,t["title"]),"size":"xs","color":"#FF6B35","wrap":True,"flex":5,"gravity":"center","margin":"sm"},
-            {"type":"button","action":{"type":"postback","label":"🗑️","data":"action=confirm_delete&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center","margin":"sm"},
+            {"type":"button","action":{"type":"postback","label":"🗑️","data":"action=delete_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center","margin":"sm"},
         ],"margin":"sm"})
     if not pi: pi.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
     if done and not pend: st,sc="🏆 ยอดเยี่ยม!","#1DB446"
@@ -496,6 +496,16 @@ def handle_pb(data, cid, tok, uid="", name=""):
         if t: reply_msg(tok,aqr("✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ {} งาน".format(t["title"],len(get_pending_tasks(cid)))))
         else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
 
+    # ── done/delete จากหน้าสรุป → ทำเลย + ส่งสรุปใหม่ ──
+    elif act=="done_refresh" and tid:
+        t=complete_task(int(tid),name,uid)
+        if t: reply_msg(tok,build_summary(cid))
+        else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
+    elif act=="delete_refresh" and tid:
+        t=delete_task(int(tid),name,uid)
+        if t: reply_msg(tok,build_summary(cid))
+        else: reply_msg(tok,aqr("❌ ไม่พบงานนี้"))
+
     # ── ยืนยันก่อนลบ ──
     elif act=="confirm_delete" and tid:
         t=get_task(int(tid))
@@ -606,6 +616,25 @@ def api_ask(tid):
 def api_log(tid):
     return jsonify(get_activity_log(tid, 50))
 
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    import uuid
+    f = request.files.get("file")
+    if not f: return jsonify({"error":"no file"}), 400
+    ext = f.filename.rsplit(".",1)[-1] if "." in f.filename else "jpg"
+    fname = "{}.{}".format(uuid.uuid4().hex[:12], ext)
+    upload_dir = os.path.join(os.path.dirname(DATABASE_PATH) or ".", "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    fpath = os.path.join(upload_dir, fname)
+    f.save(fpath)
+    return jsonify({"url":"/uploads/"+fname})
+
+@app.route("/api/members/<path:cid>")
+def api_members(cid):
+    with get_db() as c:
+        rows = c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=?",(cid,)).fetchall()
+    return jsonify([{"uid":r["user_id"],"name":r["display_name"]} for r in rows])
+
 # ══════════════════════════════════════════════════════════════
 # Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
@@ -647,6 +676,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .cbar{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #eee;padding:8px 12px;display:flex;gap:8px;background:#fff;z-index:20}
 .cbar input{flex:1;padding:9px 14px;border:1.5px solid #ddd;border-radius:22px;font-size:13px;outline:none}.cbar input:focus{border-color:#1DB446}
 .cbar button{background:#1DB446;color:#fff;border:none;border-radius:50%;width:38px;height:38px;font-size:16px;cursor:pointer}
+.cbar .attach-btn{background:#FF9800;font-size:14px}
+.cmt .cb a{color:#1DB446;text-decoration:underline;word-break:break-all}
+.cmt .cb img{max-width:100%;border-radius:8px;margin-top:6px;cursor:pointer}
+.img-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.9);z-index:200;display:none;justify-content:center;align-items:center;touch-action:pan-x}
+.img-overlay img{max-width:95vw;max-height:90vh;object-fit:contain}
+.img-overlay .close-x{position:fixed;top:12px;right:16px;color:#fff;font-size:28px;cursor:pointer;z-index:201}
 .toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 20px;border-radius:20px;font-size:13px;z-index:100;display:none}
 .confirm-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:50;display:none;justify-content:center;align-items:center}
 .confirm-box{background:#fff;border-radius:16px;padding:24px;max-width:300px;text-align:center}
@@ -664,8 +699,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </div>
 <div class="app" id="app">
   <div class="namebox" id="nameBox">
-    <input id="nameInput" placeholder="ชื่อของคุณ" onkeypress="if(event.key==='Enter')setName()">
-    <button onclick="setName()">OK</button>
+    <select id="nameSelect" style="padding:8px;border:2px solid #1DB446;border-radius:8px;font-size:14px;width:65%"><option value="">-- เลือกชื่อ --</option></select>
+    <button onclick="pickName()">OK</button>
   </div>
   <div class="head">
     <div class="idx" id="tidx">#1 ⬜</div>
@@ -684,27 +719,37 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div class="arow"><button class="abtn a-ask" id="askBtn" onclick="askOwner()" style="display:none">🙋 ถามคนสั่ง</button>
     <button class="abtn a-del" onclick="confirmDelete()">🗑️ ลบงาน</button></div>
   </div>
-  <div class="cbar"><input id="cinput" placeholder="พิมพ์ comment..." onkeypress="if(event.key==='Enter')sendCmt()"><button onclick="sendCmt()">➤</button></div>
+  <div class="cbar"><input id="cinput" placeholder="พิมพ์ comment / วาง link..." onkeypress="if(event.key==='Enter')sendCmt()"><button class="attach-btn" onclick="document.getElementById('fup').click()">📎</button><button onclick="sendCmt()">➤</button></div>
+  <input type="file" id="fup" accept="image/*" style="display:none" onchange="uploadImg(this)">
+</div>
+<div class="img-overlay" id="imgOverlay" onclick="this.style.display='none'">
+  <div class="close-x" onclick="document.getElementById('imgOverlay').style.display='none'">✕</div>
+  <img id="imgFull" src="">
 </div>
 <script>
-const API="";let taskId,task,userName="";
+var API="",taskId,task,userName="",members=[];
 async function init(){
   var el=document.getElementById("loading");
   taskId=new URLSearchParams(location.search).get("task_id");
+  userName=decodeURIComponent(new URLSearchParams(location.search).get("name")||"");
   if(!taskId){el.textContent="ไม่มี task_id";return}
-  try{await load();el.style.display="none";document.getElementById("app").style.display="block";
-  document.getElementById("nameBox").style.display="block"}
-  catch(e){el.textContent="โหลดไม่ได้: "+e.message}}
-function setName(){var v=document.getElementById("nameInput").value.trim();
-  if(!v){document.getElementById("nameInput").focus();return}
-  userName=v;document.getElementById("nameBox").style.display="none";toast("สวัสดี "+v+" !")}
-function getName(){
-  if(userName)return userName;
-  var v=prompt("กรุณาใส่ชื่อของคุณ:");
-  if(v&&v.trim()){userName=v.trim();return userName}
-  return ""}
+  try{
+    await load();
+    el.style.display="none";document.getElementById("app").style.display="block";
+    if(!userName&&task.chat_id){
+      try{var mr=await fetch(API+"/api/members/"+encodeURIComponent(task.chat_id));
+      if(mr.ok){members=await mr.json();
+        if(members.length>0){var sel=document.getElementById("nameSelect");
+          members.forEach(function(m){var o=document.createElement("option");o.value=m.name;o.textContent=m.name;sel.appendChild(o)});
+          document.getElementById("nameBox").style.display="block"}
+        else{userName="ผู้ใช้"}}}catch(e){userName="ผู้ใช้"}}
+    if(userName)document.getElementById("nameBox").style.display="none";
+  }catch(e){el.textContent="โหลดไม่ได้: "+e.message}}
+function pickName(){var v=document.getElementById("nameSelect").value;
+  if(!v)return;userName=v;document.getElementById("nameBox").style.display="none";toast("สวัสดี "+v+" !")}
+function gn(){return userName||"ผู้ใช้"}
 async function load(){
-  const r=await fetch(API+"/api/task/"+taskId);if(!r.ok)throw new Error("Task not found");task=await r.json();render()}
+  var r=await fetch(API+"/api/task/"+taskId);if(!r.ok)throw new Error("Task not found");task=await r.json();render()}
 function render(){
   document.getElementById("tidx").textContent="#"+(task.index||task.id)+" "+(task.status==="pending"?"⬜":"✅");
   document.getElementById("ttitle").textContent=task.title;
@@ -712,12 +757,19 @@ function render(){
   var dt="";if(task.created_at){try{var d=new Date(task.created_at);dt=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
   document.getElementById("tdate").textContent="เมื่อ: "+(dt||"-");
   var b=document.getElementById("askBtn");if(task.added_by_user_id){b.style.display="flex";b.textContent="🙋 ถามคนสั่ง ("+(task.added_by||"?").substring(0,10)+")"}
+  if(task.status!=="pending"){document.querySelector(".actions").style.display="none"}
   renderComments();renderLog()}
+function fmtContent(raw){
+  var s=esc(raw);
+  s=s.replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
+  s=s.replace(/\[img:(\/uploads\/[^\]]+)\]/g,'<img src="$1" onclick="viewImg(this.src)">');
+  return s}
+function viewImg(src){var o=document.getElementById("imgOverlay");document.getElementById("imgFull").src=src;o.style.display="flex"}
 function renderComments(){
   var el=document.getElementById("commentsTab"),c=task.comments||[];
   if(!c.length){el.innerHTML='<div class="nocmt">ยังไม่มี comment<br>พิมพ์ด้านล่าง 👇</div>';return}
   el.innerHTML=c.map(function(x){var t="";if(x.created_at){try{t=new Date(x.created_at).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
-  return'<div class="cmt"><div class="ct"><span class="cn">'+esc(x.author||"?")+'</span><span class="ctm">'+(t||"-")+'</span></div><div class="cb">'+esc(x.content)+'</div></div>'}).join("")}
+  return'<div class="cmt"><div class="ct"><span class="cn">'+esc(x.author||"?")+'</span><span class="ctm">'+(t||"-")+'</span></div><div class="cb">'+fmtContent(x.content)+'</div></div>'}).join("")}
 function renderLog(){
   var el=document.getElementById("logTab"),logs=task.logs||[];
   if(!logs.length){el.innerHTML='<div class="nocmt">ยังไม่มี activity log</div>';return}
@@ -731,21 +783,31 @@ function showTab(tab){
 function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML}
 function showEdit(){document.getElementById("einput").value=task.title;document.getElementById("ebox").style.display="block";document.getElementById("einput").focus()}
 function hideEdit(){document.getElementById("ebox").style.display="none"}
-async function saveEdit(){var n=getName();if(!n)return;var v=document.getElementById("einput").value.trim();if(!v)return;
-  await fetch(API+"/api/task/"+taskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:v,author:n,author_uid:""})});
+async function saveEdit(){var v=document.getElementById("einput").value.trim();if(!v)return;
+  await fetch(API+"/api/task/"+taskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:v,author:gn(),author_uid:""})});
   await load();hideEdit();toast("✏️ แก้ไขแล้ว!")}
-async function sendCmt(){var n=getName();if(!n)return;var inp=document.getElementById("cinput"),v=inp.value.trim();if(!v)return;inp.value="";
-  await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:n,author_uid:""})});
+async function sendCmt(){var inp=document.getElementById("cinput"),v=inp.value.trim();if(!v)return;inp.value="";
+  await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:gn(),author_uid:""})});
   await load();toast("💬 เพิ่ม comment แล้ว!")}
-function confirmDone(){var n=getName();if(!n)return;showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
-  await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:n,author_uid:""})});
-  toast("✅ เสร็จแล้ว!");setTimeout(function(){location.reload()},1000)})}
-function confirmDelete(){var n=getName();if(!n)return;showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
-  await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:n,author_uid:""})});
-  toast("🗑️ ลบแล้ว!");setTimeout(function(){location.reload()},1000)})}
+function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
+  await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
+  toast("✅ เสร็จแล้ว!");await load()})}
+function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
+  await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
+  toast("🗑️ ลบแล้ว!");await load()})}
+async function uploadImg(input){
+  if(!input.files||!input.files[0])return;
+  var fd=new FormData();fd.append("file",input.files[0]);
+  toast("📤 กำลังอัพโหลด...");
+  try{var r=await fetch(API+"/api/upload",{method:"POST",body:fd});
+    if(r.ok){var d=await r.json();
+      await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:"[img:"+d.url+"]",author:gn(),author_uid:""})});
+      await load();toast("📷 เพิ่มรูปแล้ว!")}
+    else toast("อัพโหลดไม่ได้")}catch(e){toast("อัพโหลดไม่ได้: "+e.message)}
+  input.value=""}
 async function askOwner(){
   var r=await fetch(API+"/api/task/"+taskId+"/ask-owner",{method:"POST"});
-  if(r.ok){toast("🙋 tag คนสั่งแล้ว!")}else toast("ไม่สามารถ tag ได้")}
+  if(r.ok)toast("🙋 tag คนสั่งแล้ว!");else toast("ไม่สามารถ tag ได้")}
 function showConfirm(title,msg,onYes){document.getElementById("confirmTitle").textContent=title;document.getElementById("confirmMsg").textContent=msg;
   document.getElementById("confirmYes").onclick=function(){hideConfirm();onYes()};document.getElementById("confirmOverlay").style.display="flex"}
 function hideConfirm(){document.getElementById("confirmOverlay").style.display="none"}
@@ -762,6 +824,12 @@ def send_daily():
     for cid in get_active_chats():
         try: push_msg(cid, build_summary(cid))
         except Exception as e: app.logger.error("Sum err %s: %s",cid,e)
+
+@app.route("/uploads/<path:fname>")
+def serve_upload(fname):
+    from flask import send_from_directory
+    upload_dir = os.path.join(os.path.dirname(DATABASE_PATH) or ".", "uploads")
+    return send_from_directory(upload_dir, fname)
 
 @app.route("/", methods=["GET"])
 def health(): return "LINE Todo Bot v6 running!"
