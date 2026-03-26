@@ -496,15 +496,27 @@ def handle_pb(data, cid, tok, uid="", name=""):
         if t: reply_msg(tok,aqr("✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ {} งาน".format(t["title"],len(get_pending_tasks(cid)))))
         else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
 
-    # ── done/delete จากหน้าสรุป → ทำเลย + ส่งสรุปใหม่ ──
+    # ── done/delete จากหน้าสรุป → ทำเลย + ตอบผลลัพธ์ + สรุปใหม่ ──
     elif act=="done_refresh" and tid:
-        t=complete_task(int(tid),name,uid)
-        if t: reply_msg(tok,build_summary(cid))
-        else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
+        try:
+            t=complete_task(int(tid),name,uid)
+            if t:
+                pend=get_pending_tasks(cid)
+                reply_msg(tok,aqr("✅ เสร็จ: {}\n📌 เหลือ {} งาน".format(t["title"],len(pend))))
+            else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
+        except Exception as e:
+            app.logger.error("done_refresh err: %s",e)
+            reply_msg(tok,aqr("❌ error: {}".format(str(e))))
     elif act=="delete_refresh" and tid:
-        t=delete_task(int(tid),name,uid)
-        if t: reply_msg(tok,build_summary(cid))
-        else: reply_msg(tok,aqr("❌ ไม่พบงานนี้"))
+        try:
+            t=delete_task(int(tid),name,uid)
+            if t:
+                pend=get_pending_tasks(cid)
+                reply_msg(tok,aqr("🗑️ ลบแล้ว: {}\n📌 เหลือ {} งาน".format(t["title"],len(pend))))
+            else: reply_msg(tok,aqr("❌ ไม่พบงานนี้"))
+        except Exception as e:
+            app.logger.error("delete_refresh err: %s",e)
+            reply_msg(tok,aqr("❌ error: {}".format(str(e))))
 
     # ── ยืนยันก่อนลบ ──
     elif act=="confirm_delete" and tid:
@@ -669,6 +681,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .log-item{background:#fff;border-radius:8px;padding:8px 10px;margin-bottom:4px;font-size:12px;display:flex;gap:8px;align-items:flex-start}
 .log-icon{font-size:16px;flex-shrink:0}.log-body{flex:1}.log-user{font-weight:bold;color:#333}.log-detail{color:#666;margin-top:2px}
 .log-time{font-size:10px;color:#aaa;flex-shrink:0}
+.done-banner{display:none;background:#E8F5E9;padding:16px;text-align:center;border-radius:12px;margin:12px 16px}
+.done-banner .done-icon{font-size:42px;margin-bottom:6px}
+.done-banner .done-text{font-size:16px;font-weight:bold;color:#1DB446}
+.done-banner .done-sub{font-size:12px;color:#666;margin-top:4px}
 .actions{padding:8px 16px;display:flex;flex-direction:column;gap:6px}
 .arow{display:flex;gap:6px}
 .abtn{flex:1;padding:11px;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;text-align:center}
@@ -714,6 +730,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div id="commentsTab"></div>
     <div id="logTab" style="display:none"></div>
   </div>
+  <div class="done-banner" id="doneBanner">
+    <div class="done-icon">✅</div>
+    <div class="done-text">งานนี้เสร็จแล้ว!</div>
+    <div class="done-sub">ดู comments และ activity log ด้านบน</div>
+  </div>
   <div class="actions">
     <div class="arow"><button class="abtn a-done" onclick="confirmDone()">✅ เสร็จแล้ว</button></div>
     <div class="arow"><button class="abtn a-ask" id="askBtn" onclick="askOwner()" style="display:none">🙋 ถามคนสั่ง</button>
@@ -757,7 +778,10 @@ function render(){
   var dt="";if(task.created_at){try{var d=new Date(task.created_at);dt=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})}catch(e){}}
   document.getElementById("tdate").textContent="เมื่อ: "+(dt||"-");
   var b=document.getElementById("askBtn");if(task.added_by_user_id){b.style.display="flex";b.textContent="🙋 ถามคนสั่ง ("+(task.added_by||"?").substring(0,10)+")"}
-  if(task.status!=="pending"){document.querySelector(".actions").style.display="none"}
+  var acts=document.querySelector(".actions");
+  var doneBar=document.getElementById("doneBanner");
+  if(task.status!=="pending"){acts.style.display="none";doneBar.style.display="block"}
+  else{acts.style.display="flex";doneBar.style.display="none"}
   renderComments();renderLog()}
 function fmtContent(raw){
   var s=esc(raw);
@@ -790,11 +814,12 @@ async function sendCmt(){var inp=document.getElementById("cinput"),v=inp.value.t
   await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:gn(),author_uid:""})});
   await load();toast("💬 เพิ่ม comment แล้ว!")}
 function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
-  await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  toast("✅ เสร็จแล้ว!");await load()})}
+  var r=await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
+  if(r.ok){toast("✅ เสร็จแล้ว!");await load()}else{toast("ทำไม่ได้ ลองใหม่")}})}
 function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
-  await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  toast("🗑️ ลบแล้ว!");await load()})}
+  var r=await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
+  if(r.ok){toast("🗑️ ลบแล้ว!");document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">🗑️</div><div style="font-size:18px;font-weight:bold;color:#E53935;margin-top:12px">ลบงานแล้ว</div><div style="font-size:13px;color:#999;margin-top:6px">ปิดหน้านี้ได้เลย</div></div>'}
+  else{toast("ลบไม่ได้ ลองใหม่")}})}
 async function uploadImg(input){
   if(!input.files||!input.files[0])return;
   var fd=new FormData();fd.append("file",input.files[0]);
