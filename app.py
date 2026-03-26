@@ -198,8 +198,8 @@ def aqr(msg):
     return msg
 
 def task_page_url(tid):
-    if APP_URL: return APP_URL.rstrip("/")+"/liff/task?task_id={}".format(tid)
     if LIFF_ID: return "https://liff.line.me/{}?task_id={}".format(LIFF_ID, tid)
+    if APP_URL: return APP_URL.rstrip("/")+"/liff/task?task_id={}".format(tid)
     return None
 
 # ── Flex Cards ───────────────────────────────────────────────
