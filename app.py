@@ -502,14 +502,24 @@ def handle_pb(data, cid, tok, uid="", name=""):
         if t: reply_msg(tok,aqr("✅ เสร็จแล้ว!\n✔️ {}\n📌 เหลือ {} งาน".format(t["title"],len(get_pending_tasks(cid)))))
         else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
 
-    # ── done/delete จากหน้าสรุป → ทำเลย + ตอบผลลัพธ์ + สรุปใหม่ ──
+    # ── done/delete จากหน้าสรุป → ทำเลย + ตอบ Flex card ──
     elif act=="done_refresh" and tid:
         try:
             t=complete_task(int(tid),name,uid)
             if t:
                 pend=get_pending_tasks(cid)
-                reply_msg(tok,aqr("✅ เสร็จ: {}\n📌 เหลือ {} งาน".format(t["title"],len(pend))))
-            else: reply_msg(tok,aqr("❌ งานนี้เสร็จไปแล้ว"))
+                reply_msg(tok,aqr({"type":"flex","altText":"✅ เสร็จ: {}".format(t["title"]),"contents":{"type":"bubble","size":"kilo",
+                    "body":{"type":"box","layout":"vertical","backgroundColor":"#E8F5E9","cornerRadius":"lg","paddingAll":"lg","contents":[
+                        {"type":"text","text":"✅ เสร็จแล้ว!","weight":"bold","size":"lg","color":"#2E7D32","align":"center"},
+                        {"type":"text","text":t["title"],"size":"md","color":"#333333","align":"center","margin":"md","wrap":True},
+                        {"type":"separator","margin":"lg","color":"#C8E6C9"},
+                        {"type":"text","text":"📌 เหลือ {} งาน".format(len(pend)),"size":"sm","color":"#666666","align":"center","margin":"md"}
+                    ]}}}))
+            else:
+                reply_msg(tok,aqr({"type":"flex","altText":"งานนี้เสร็จไปแล้ว","contents":{"type":"bubble","size":"kilo",
+                    "body":{"type":"box","layout":"vertical","backgroundColor":"#FFF3E0","cornerRadius":"lg","paddingAll":"lg","contents":[
+                        {"type":"text","text":"⚠️ งานนี้เสร็จไปแล้ว","weight":"bold","size":"sm","color":"#E65100","align":"center"}
+                    ]}}}))
         except Exception as e:
             app.logger.error("done_refresh err: %s",e)
             reply_msg(tok,aqr("❌ error: {}".format(str(e))))
@@ -518,8 +528,18 @@ def handle_pb(data, cid, tok, uid="", name=""):
             t=delete_task(int(tid),name,uid)
             if t:
                 pend=get_pending_tasks(cid)
-                reply_msg(tok,aqr("🗑️ ลบแล้ว: {}\n📌 เหลือ {} งาน".format(t["title"],len(pend))))
-            else: reply_msg(tok,aqr("❌ ไม่พบงานนี้"))
+                reply_msg(tok,aqr({"type":"flex","altText":"🗑️ ลบแล้ว: {}".format(t["title"]),"contents":{"type":"bubble","size":"kilo",
+                    "body":{"type":"box","layout":"vertical","backgroundColor":"#FFEBEE","cornerRadius":"lg","paddingAll":"lg","contents":[
+                        {"type":"text","text":"🗑️ ลบงานแล้ว","weight":"bold","size":"lg","color":"#C62828","align":"center"},
+                        {"type":"text","text":t["title"],"size":"md","color":"#333333","align":"center","margin":"md","wrap":True,"decoration":"line-through"},
+                        {"type":"separator","margin":"lg","color":"#FFCDD2"},
+                        {"type":"text","text":"📌 เหลือ {} งาน".format(len(pend)),"size":"sm","color":"#666666","align":"center","margin":"md"}
+                    ]}}}))
+            else:
+                reply_msg(tok,aqr({"type":"flex","altText":"ไม่พบงานนี้","contents":{"type":"bubble","size":"kilo",
+                    "body":{"type":"box","layout":"vertical","backgroundColor":"#FFF3E0","cornerRadius":"lg","paddingAll":"lg","contents":[
+                        {"type":"text","text":"⚠️ ไม่พบงานนี้","weight":"bold","size":"sm","color":"#E65100","align":"center"}
+                    ]}}}))
         except Exception as e:
             app.logger.error("delete_refresh err: %s",e)
             reply_msg(tok,aqr("❌ error: {}".format(str(e))))
@@ -821,10 +841,10 @@ async function sendCmt(){var inp=document.getElementById("cinput"),v=inp.value.t
   await load();toast("💬 เพิ่ม comment แล้ว!")}
 function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
   var r=await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">✅</div><div style="font-size:18px;font-weight:bold;color:#43A047;margin-top:12px">เสร็จแล้ว!</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังปิดหน้านี้...</div></div>';setTimeout(function(){try{window.close()}catch(e){}},1500)}else{toast("ทำไม่ได้ ลองใหม่")}})}
+  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">✅</div><div style="font-size:18px;font-weight:bold;color:#43A047;margin-top:12px">เสร็จแล้ว!</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังกลับไปแชท...</div></div>';setTimeout(function(){location.href="https://line.me/R/"},1200)}else{toast("ทำไม่ได้ ลองใหม่")}})}
 function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
   var r=await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">🗑️</div><div style="font-size:18px;font-weight:bold;color:#E53935;margin-top:12px">ลบงานแล้ว</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังปิดหน้านี้...</div></div>';setTimeout(function(){try{window.close()}catch(e){}},1500)}
+  if(r.ok){document.getElementById("app").innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:60vh"><div style="font-size:48px">🗑️</div><div style="font-size:18px;font-weight:bold;color:#E53935;margin-top:12px">ลบงานแล้ว</div><div style="font-size:13px;color:#999;margin-top:6px">กำลังกลับไปแชท...</div></div>';setTimeout(function(){location.href="https://line.me/R/"},1200)}
   else{toast("ลบไม่ได้ ลองใหม่")}})}
 async function uploadImg(input){
   if(!input.files||!input.files[0])return;
