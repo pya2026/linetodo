@@ -534,14 +534,63 @@ def build_help():
             {"type":"text","text":"📌 @ชื่อ งาน → เช็คงานของคนนั้น","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"เช่น: @สมชาย งาน","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
-            {"type":"text","text":"➕ เพิ่มหลายงานทีเดียว","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"➕ เพิ่มหลายงาน + กำหนดวัน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"เช่น: เพิ่ม งาน1,งาน2,งาน3","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"text","text":"📅 หลายวัน:","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"text","text":"เพิ่ม\\nพรุ่งนี้ งาน1,งาน2\\n30/03 งาน3\\nศุกร์ งาน4","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"📋 งานของฉัน → ดูงานที่มอบหมายให้","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"🌅 เข้างาน / 🌆 เลิกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"เข้างาน → ดูงานวันนี้ / เลิกงาน → สรุปผล","size":"xs","color":"#666666","margin":"sm"},
         ],"paddingAll":"15px"}}})
+
+# ── Multi-date task parser ────────────────────────────────────
+DATE_LINE_RE=re.compile(
+    r'^(พรุ่งนี้|มะรืน|วันนี้|tomorrow|today'
+    r'|\d{1,2}/\d{1,2}(?:/\d{2,4})?'
+    r'|จันทร์|อังคาร|พุธ|พฤหัส|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์)\s+(.+)',
+    re.I)
+
+def _parse_and_add_tasks(raw, cid, name, uid, assigned_to="", assigned_to_uid=""):
+    """Parse raw text that may contain multi-date blocks and add tasks.
+    Supported formats:
+      1) Single line: งาน1,งาน2  (no date)
+      2) Single line with date: พรุ่งนี้ งาน1,งาน2
+      3) Multi-line with date headers:
+           พรุ่งนี้ งาน1,งาน2
+           30/03 งาน3,งาน4
+           ศุกร์ งาน5
+    """
+    lines=raw.split("\n")
+    lines=[l.strip() for l in lines]
+    lines=[l for l in lines if l]
+
+    added=[]
+    for line in lines:
+        dm=DATE_LINE_RE.match(line)
+        if dm:
+            date_part=dm.group(1)
+            tasks_part=dm.group(2)
+            due,_=parse_due_date(date_part+" dummy")
+            sub_items=re.split(r'[,]+', tasks_part)
+            sub_items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in sub_items]
+            sub_items=[x for x in sub_items if x]
+            for title in sub_items:
+                t=add_task(cid,title,by=name,by_uid=uid,assigned_to=assigned_to,assigned_to_uid=assigned_to_uid)
+                if due: set_due_date(t["id"],due)
+                added.append(get_task(t["id"]))
+        else:
+            sub_items=re.split(r'[,]+', line)
+            sub_items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in sub_items]
+            sub_items=[x for x in sub_items if x]
+            for it in sub_items:
+                due,title=parse_due_date(it)
+                if not title.strip(): continue
+                t=add_task(cid,title,by=name,by_uid=uid,assigned_to=assigned_to,assigned_to_uid=assigned_to_uid)
+                if due: set_due_date(t["id"],due)
+                added.append(get_task(t["id"]))
+    return added
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
@@ -569,25 +618,16 @@ def process_text(text, cid, uid="", name=""):
     m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
     if m:
         raw=m.group(1).strip()
-        items=re.split(r'[,\n]+', raw)
-        items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in items]
-        items=[x for x in items if x]
-        if len(items)>1:
-            added=[]
-            for it in items:
-                due,title=parse_due_date(it)
-                t=add_task(cid,title,by=name,by_uid=uid)
-                if due: set_due_date(t["id"],due)
-                added.append(get_task(t["id"]))
+        added=_parse_and_add_tasks(raw, cid, name, uid)
+        if len(added)==1:
+            return build_task_flex(added[0]["id"])
+        if len(added)>1:
             cards=[build_mini_card(t,i) for i,t in enumerate(added,1)]
             return aqr({"type":"flex","altText":"➕ เพิ่ม {} งาน".format(len(added)),"contents":{"type":"carousel","contents":cards[:10]}})
-        due,title=parse_due_date(items[0] if items else raw)
-        t=add_task(cid,title,by=name,by_uid=uid)
-        if due: set_due_date(t["id"],due)
-        return build_task_flex(t["id"])
+        return aqr("❌ ไม่พบชื่องาน")
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
-    # @ชื่อ เพิ่ม งาน1,งาน2 → มอบหมายงานให้คนอื่น
+    # @ชื่อ เพิ่ม งาน1,งาน2 → มอบหมายงานให้คนอื่น (รองรับ multi-date)
     am=re.match(r"^@(\S+)\s+(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
     if am:
         aname=am.group(1).strip(); atitle=am.group(2).strip()
@@ -595,18 +635,12 @@ def process_text(text, cid, uid="", name=""):
         with get_db() as c:
             mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+aname+"%")).fetchone()
             if mr: aname=mr["display_name"]; auid=mr["user_id"]
-        items=re.split(r'[,\n]+', atitle)
-        items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in items]
-        items=[x for x in items if x]
-        added=[]
-        for it in items:
-            due,title=parse_due_date(it)
-            t=add_task(cid,title,by=name,by_uid=uid,assigned_to=aname,assigned_to_uid=auid)
-            if due: set_due_date(t["id"],due)
-            added.append(get_task(t["id"]))
+        added=_parse_and_add_tasks(atitle, cid, name, uid, assigned_to=aname, assigned_to_uid=auid)
         if len(added)==1:
             return aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(added[0]["title"],aname))
-        return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
+        if len(added)>1:
+            return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
+        return aqr("❌ ไม่พบชื่องาน")
     # @ชื่อ งาน → ดูงานค้างของคนนั้น
     am2=re.match(r"^@(\S+)\s*(?:งาน|tasks?)?$",ts,re.I)
     if am2:
