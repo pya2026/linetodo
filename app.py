@@ -744,13 +744,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f5;
 <div class="toast" id="toast"></div>
 <script>
 var API="",chatId,selections={},tasks=[];
-function init(){
+function getChatId(){
   var sp=new URLSearchParams(location.search);
-  chatId=sp.get("chat_id");
-  if(!chatId){var ls=sp.get("liff.state");if(ls){chatId=new URLSearchParams(ls.replace(/^\\?/,"")).get("chat_id")}}
-  if(!chatId){document.getElementById("main").innerHTML='<div class="empty">ไม่มี chat_id</div>';return}
-  var d=new Date();document.getElementById("dateText").textContent=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
-  load();
+  var cid=sp.get("chat_id");
+  if(cid)return cid;
+  var ls=sp.get("liff.state")||"";
+  if(ls){var idx=ls.indexOf("chat_id=");if(idx>=0){var val=ls.substring(idx+8);var amp=val.indexOf("&");if(amp>=0)val=val.substring(0,amp);return decodeURIComponent(val)}}
+  var h=location.hash||"";if(h){var hi=h.indexOf("chat_id=");if(hi>=0){var hv=h.substring(hi+8);var ha=hv.indexOf("&");if(ha>=0)hv=hv.substring(0,ha);return decodeURIComponent(hv)}}
+  return null;
+}
+function init(){
+  try{
+    chatId=getChatId();
+    if(!chatId){document.getElementById("main").innerHTML='<div class="empty">ไม่มี chat_id<br><small style="color:#bbb">URL: '+location.href+'</small></div>';return}
+    var d=new Date();document.getElementById("dateText").textContent=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
+    load();
+  }catch(e){document.getElementById("main").innerHTML='<div class="empty">Error: '+e.message+'</div>'}
 }
 async function load(){
   try{
