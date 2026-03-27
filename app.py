@@ -141,6 +141,47 @@ def parse_due_date(text):
         return d.strftime("%Y-%m-%d"), m.group(2).strip()
     return None, text
 
+def parse_date_only(text):
+    """Parse date from text (date only, no task title needed). Returns YYYY-MM-DD or None."""
+    from datetime import timedelta, date
+    today=datetime.now().date()
+    t=text.strip().lower()
+    if t in ["พรุ่งนี้","tomorrow"]: return (today+timedelta(days=1)).strftime("%Y-%m-%d")
+    if t in ["มะรืน"]: return (today+timedelta(days=2)).strftime("%Y-%m-%d")
+    if t in ["วันนี้","today"]: return today.strftime("%Y-%m-%d")
+    m=re.match(r'^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$',t)
+    if m:
+        dd,mm=int(m.group(1)),int(m.group(2))
+        yy=int(m.group(3)) if m.group(3) else today.year
+        if yy<100: yy+=2000
+        try: return date(yy,mm,dd).strftime("%Y-%m-%d")
+        except: pass
+    days_th={"จันทร์":0,"อังคาร":1,"พุธ":2,"พฤหัส":3,"พฤหัสบดี":3,"ศุกร์":4,"เสาร์":5,"อาทิตย์":6}
+    for dn,dv in days_th.items():
+        if t==dn:
+            diff=(dv-today.weekday())%7
+            if diff==0: diff=7
+            return (today+timedelta(days=diff)).strftime("%Y-%m-%d")
+    return None
+
+def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
+    """Query pending tasks filtered by person and optional due_date."""
+    with get_db() as c:
+        if uid:
+            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?)"
+            params=[cid, uid, uid]
+        elif name:
+            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to LIKE ? OR added_by LIKE ?)"
+            params=[cid, "%"+name+"%", "%"+name+"%"]
+        else:
+            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending'"
+            params=[cid]
+        if due_date:
+            sql+=" AND due_date=?"
+            params.append(due_date)
+        sql+=" ORDER BY created_at"
+        return c.execute(sql, params).fetchall()
+
 def set_due_date(tid, due):
     with get_db() as c:
         c.execute("UPDATE tasks SET due_date=? WHERE id=?",(due,tid))
@@ -261,9 +302,18 @@ def build_mini_card(task, idx):
             {"type":"button","action":{"type":"postback","label":"✅ เสร็จ","data":"action=done&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]
     # แสดง comment ล่าสุดถ้ามี
     comments=get_comments(tid)
+    assigned=task.get("assigned_to","")
+    due=task.get("due_date","")
     body_contents=[
-        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
-        {"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"}]
+        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"}]
+    if assigned:
+        body_contents.append({"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assigned),"size":"xs","color":"#FF6B35","weight":"bold"})
+    if due:
+        try:
+            dd=datetime.strptime(due,"%Y-%m-%d").strftime("%d/%m/%y")
+            body_contents.append({"type":"text","text":"📅 กำหนด: {}".format(dd),"size":"xs","color":"#0066CC"})
+        except: pass
+    body_contents.append({"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"})
     if comments:
         c=comments[-1]; ts=""
         if c.get("created_at"):
@@ -594,7 +644,7 @@ def _parse_and_add_tasks(raw, cid, name, uid, assigned_to="", assigned_to_uid=""
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -641,29 +691,98 @@ def process_text(text, cid, uid="", name=""):
         if len(added)>1:
             return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
         return aqr("❌ ไม่พบชื่องาน")
-    # @ชื่อ งาน → ดูงานค้างของคนนั้น
-    am2=re.match(r"^@(\S+)\s*(?:งาน|tasks?)?$",ts,re.I)
+    # ── ดูงาน / งาน@ชื่อ / สรุปงาน / สรุปงาน@ชื่อ (+ optional date) ──
+    # Helper: resolve @name to uid+display
+    def _resolve_name(n):
+        rn=n; ru=""
+        with get_db() as c:
+            mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+n+"%")).fetchone()
+            if mr: rn=mr["display_name"]; ru=mr["user_id"]
+        return rn, ru
+
+    def _show_tasks(tasks, label, date_str=None):
+        if not tasks: return aqr("🎉 ไม่มีงานค้าง{}{}".format(" ของ "+label if label!="ฉัน" else "ของคุณ"," ("+date_str+")" if date_str else ""))
+        cards=[build_mini_card(dict(t),i) for i,t in enumerate(tasks,1)]
+        alt="📋 งาน{} {} งาน".format("ของ "+label if label!="ฉัน" else "ของฉัน",len(tasks))
+        return aqr({"type":"flex","altText":alt,"contents":{"type":"carousel","contents":cards[:10]}})
+
+    # Pattern: @ชื่อ งาน [date] — e.g. "@Sun งาน", "@Sun งาน 30/03"
+    am2=re.match(r"^@(\S+)\s+(?:งาน|tasks?)\s*(.*)?$",ts,re.I)
     if am2:
-        aname=am2.group(1).strip(); auid=""
-        with get_db() as c:
-            mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+aname+"%")).fetchone()
-            if mr: aname=mr["display_name"]; auid=mr["user_id"]
-            # ดูงานที่ assigned ให้คนนี้ + งานที่คนนี้สร้าง
-            if auid:
-                my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?) ORDER BY created_at",(cid,auid,auid)).fetchall()
-            else:
-                my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to LIKE ? OR added_by LIKE ?) ORDER BY created_at",(cid,"%"+aname+"%","%"+aname+"%")).fetchall()
+        aname,auid=_resolve_name(am2.group(1).strip())
+        date_part=(am2.group(2) or "").strip()
+        due=parse_date_only(date_part) if date_part else None
+        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
+        return _show_tasks(my, aname, date_part if due else None)
+
+    # Pattern: งาน@ชื่อ [date] — e.g. "งาน@Sun", "งาน@Sun 30/03"
+    am3=re.match(r"^(?:งาน|tasks?)@(\S+)\s*(.*)?$",ts,re.I)
+    if am3:
+        aname,auid=_resolve_name(am3.group(1).strip())
+        date_part=(am3.group(2) or "").strip()
+        due=parse_date_only(date_part) if date_part else None
+        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
+        return _show_tasks(my, aname, date_part if due else None)
+
+    # Pattern: @ชื่อ สรุปงาน — e.g. "@Sun สรุปงาน"
+    am4=re.match(r"^@(\S+)\s+(?:สรุปงาน|สรุป)\s*$",ts,re.I)
+    if am4:
+        aname,auid=_resolve_name(am4.group(1).strip())
+        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None)
         if not my: return aqr("🎉 ไม่มีงานค้างของ {}".format(aname))
-        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
-        return aqr({"type":"flex","altText":"📋 งานของ {} ({} งาน)".format(aname,len(my)),"contents":{"type":"carousel","contents":cards[:10]}})
-    if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
-    # ดูงานของฉัน
+        lines=["📊 สรุปงานของ {} ({} งาน)".format(aname,len(my)),""]
+        for i,t in enumerate(my,1):
+            dd=t.get("due_date","") or "-"
+            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
+        return aqr("\n".join(lines))
+
+    # Pattern: สรุปงาน@ชื่อ — e.g. "สรุปงาน@Sun"
+    am5=re.match(r"^(?:สรุปงาน|สรุป)@(\S+)\s*$",ts,re.I)
+    if am5:
+        aname,auid=_resolve_name(am5.group(1).strip())
+        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None)
+        if not my: return aqr("🎉 ไม่มีงานค้างของ {}".format(aname))
+        lines=["📊 สรุปงานของ {} ({} งาน)".format(aname,len(my)),""]
+        for i,t in enumerate(my,1):
+            dd=t.get("due_date","") or "-"
+            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
+        return aqr("\n".join(lines))
+
+    # Pattern: ดูงาน [date] — MY tasks, optionally filtered by date
+    m_view=re.match(r"^(?:ดูงาน|list|tasks)\s*(.*)?$",ts,re.I)
+    if m_view:
+        date_part=(m_view.group(1) or "").strip()
+        due=parse_date_only(date_part) if date_part else None
+        my=query_tasks_by_person(cid, uid=uid, due_date=due)
+        return _show_tasks(my, "ฉัน", date_part if due else None)
+
+    # Pattern: งานค้าง / รายการ — all tasks (no filter)
+    if tl in ["งานค้าง","รายการ"]: return build_list_flex(cid)
+
+    # Pattern: สรุปงาน — MY summary
+    if tl in ["สรุปงาน"]:
+        my=query_tasks_by_person(cid, uid=uid)
+        if not my: return aqr("🎉 ไม่มีงานค้างของคุณ!")
+        lines=["📊 สรุปงานของคุณ ({} งาน)".format(len(my)),""]
+        for i,t in enumerate(my,1):
+            dd=t.get("due_date","") or "-"
+            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
+        return aqr("\n".join(lines))
+
+    # Pattern: งานฉัน / งานของฉัน — alias for ดูงาน (my tasks)
     if tl in ["งานฉัน","งานของฉัน","my tasks","mytasks"]:
-        with get_db() as c:
-            my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?) ORDER BY created_at",(cid,uid,uid)).fetchall()
-        if not my: return aqr("🎉 ไม่มีงานของคุณ!")
-        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
-        return aqr({"type":"flex","altText":"📋 งานของฉัน {} งาน".format(len(my)),"contents":{"type":"carousel","contents":cards[:10]}})
+        my=query_tasks_by_person(cid, uid=uid)
+        return _show_tasks(my, "ฉัน")
+
+    # Pattern: [date]งาน@ชื่อ — e.g. "30/03งาน@Sun"
+    am6=re.match(r"^(\S+?)(?:งาน|tasks?)@(\S+)\s*$",ts,re.I)
+    if am6:
+        date_part=am6.group(1).strip()
+        due=parse_date_only(date_part)
+        if due:
+            aname,auid=_resolve_name(am6.group(2).strip())
+            my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
+            return _show_tasks(my, aname, date_part)
 
     # log command
     m=re.match(r"^(?:log|ประวัติ)\s*(\d+)",ts,re.I)
