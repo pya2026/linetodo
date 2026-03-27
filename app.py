@@ -165,13 +165,20 @@ def parse_date_only(text):
     return None
 
 def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
-    """Query pending tasks filtered by person and optional due_date."""
+    """Query pending tasks filtered by ผู้รับผิดชอบ and optional due_date.
+    Logic: ถ้างานมี assigned_to → ผู้รับผิดชอบ = assigned_to
+           ถ้างานไม่มี assigned_to → ผู้รับผิดชอบ = added_by (คนสร้าง)
+    """
     with get_db() as c:
         if uid:
-            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?)"
-            params=[cid, uid, uid]
+            # งานที่ assigned ให้ฉัน OR งานที่ฉันสร้างเอง (ไม่ได้ assign ให้ใคร)
+            sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
+                 "AND (assigned_to_uid=? OR (assigned_to_uid='' AND added_by_user_id=?) "
+                 "OR (assigned_to_uid IS NULL AND added_by_user_id=?))")
+            params=[cid, uid, uid, uid]
         elif name:
-            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to LIKE ? OR added_by LIKE ?)"
+            sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
+                 "AND (assigned_to LIKE ? OR ((assigned_to='' OR assigned_to IS NULL) AND added_by LIKE ?))")
             params=[cid, "%"+name+"%", "%"+name+"%"]
         else:
             sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending'"
