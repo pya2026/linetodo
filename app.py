@@ -203,7 +203,6 @@ def task_page_url(tid):
     return None
 
 def summary_page_url(cid):
-    if LIFF_ID: return "https://liff.line.me/{}?chat_id={}".format(LIFF_ID, cid)
     if APP_URL: return APP_URL.rstrip("/")+"/liff/summary?chat_id={}".format(cid)
     return None
 
@@ -742,29 +741,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f5;
   <button class="confirm-btn" id="confirmBtn" onclick="confirmAll()">ยืนยัน</button>
 </div>
 <div class="toast" id="toast"></div>
-<div id="debug" style="display:none;padding:10px;background:#fff3cd;font-size:12px;word-break:break-all"></div>
 <script>
-window.onerror=function(msg,src,line){document.getElementById("debug").style.display="block";document.getElementById("debug").innerHTML="JS Error: "+msg+" (line "+line+")"};
 var API="",chatId,selections={},tasks=[];
 function init(){
-  try{
-    var full=location.href;
-    var sp=new URLSearchParams(location.search);
-    chatId=sp.get("chat_id");
-    if(!chatId){
-      var ls=sp.get("liff.state")||"";
-      if(ls){var idx=ls.indexOf("chat_id=");if(idx>=0){var val=ls.substring(idx+8);var amp=val.indexOf("&");if(amp>=0)val=val.substring(0,amp);chatId=decodeURIComponent(val)}}
-    }
-    if(!chatId){
-      var all=full;var ci=all.indexOf("chat_id=");
-      if(ci>=0){var cv=all.substring(ci+8);var ca=cv.indexOf("&");if(ca>=0)cv=cv.substring(0,ca);chatId=decodeURIComponent(cv)}
-    }
-    document.getElementById("debug").style.display="block";
-    document.getElementById("debug").innerHTML="DEBUG: chatId="+chatId+" | URL="+full;
-    if(!chatId){document.getElementById("main").innerHTML='<div class="empty">chat_id not found</div>';return}
-    var d=new Date();document.getElementById("dateText").textContent=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
-    load();
-  }catch(e){document.getElementById("main").innerHTML='<div class="empty">Error: '+e.message+'</div>'}
+  var sp=new URLSearchParams(location.search);
+  chatId=sp.get("chat_id");
+  if(!chatId){document.getElementById("main").innerHTML='<div class="empty">chat_id not found</div>';return}
+  document.getElementById("dateText").textContent=new Date().toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
+  load();
 }
 async function load(){
   try{
@@ -786,8 +770,8 @@ function render(done,pend){
     h+='<div class="'+cls+'" id="card-'+t.id+'">';
     h+='<div style="flex:1"><div class="title">'+(i+1)+'. '+esc(t.title)+'</div><div class="by">สั่งโดย: '+(t.added_by||"-")+'</div></div>';
     h+='<div class="btn-grp">';
-    h+='<button onclick="toggle('+t.id+',\'done\')" class="'+(sel=="done"?"act-done":"")+'">✓</button>';
-    h+='<button onclick="toggle('+t.id+',\'delete\')" class="'+(sel=="delete"?"act-del":"")+'">✕</button>';
+    h+='<button onclick="toggle('+t.id+',&quot;done&quot;)" class="'+(sel=="done"?"act-done":"")+'">✓</button>';
+    h+='<button onclick="toggle('+t.id+',&quot;delete&quot;)" class="'+(sel=="delete"?"act-del":"")+'">✕</button>';
     h+='</div></div>'});
   document.getElementById("main").innerHTML=h;
   updateBar();
@@ -1033,12 +1017,7 @@ init();
 @app.route("/liff/task")
 def task_page():
     from flask import make_response
-    # LIFF always redirects to /liff/task — detect chat_id in liff.state to route to summary
-    ls = request.args.get("liff.state","")
-    if "chat_id=" in ls and "task_id" not in ls:
-        resp = make_response(SUMMARY_PAGE_HTML)
-    else:
-        resp = make_response(TASK_PAGE_HTML)
+    resp = make_response(TASK_PAGE_HTML)
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
