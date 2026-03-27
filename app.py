@@ -166,19 +166,27 @@ def parse_date_only(text):
 
 def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
     """Query pending tasks filtered by ผู้รับผิดชอบ and optional due_date.
-    Logic: ถ้างานมี assigned_to → ผู้รับผิดชอบ = assigned_to
-           ถ้างานไม่มี assigned_to → ผู้รับผิดชอบ = added_by (คนสร้าง)
+    Logic: ถ้างานมี assigned_to (ชื่อ or uid) → ผู้รับผิดชอบ = assigned_to
+           ถ้างานไม่มี assigned_to เลย → ผู้รับผิดชอบ = added_by (คนสร้าง)
     """
     with get_db() as c:
         if uid:
-            # งานที่ assigned ให้ฉัน OR งานที่ฉันสร้างเอง (ไม่ได้ assign ให้ใคร)
+            # 1) assigned_to_uid ตรง OR
+            # 2) ไม่มี assigned เลย (ทั้ง uid+name ว่าง) แล้วเป็นคนสร้าง
             sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
-                 "AND (assigned_to_uid=? OR (assigned_to_uid='' AND added_by_user_id=?) "
-                 "OR (assigned_to_uid IS NULL AND added_by_user_id=?))")
-            params=[cid, uid, uid, uid]
+                 "AND ("
+                 "  assigned_to_uid=? "
+                 "  OR (COALESCE(assigned_to_uid,'')='' AND COALESCE(assigned_to,'')='' AND added_by_user_id=?)"
+                 ")")
+            params=[cid, uid, uid]
         elif name:
+            # 1) assigned_to ชื่อตรง OR
+            # 2) ไม่มี assigned เลย แล้ว added_by ตรง
             sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
-                 "AND (assigned_to LIKE ? OR ((assigned_to='' OR assigned_to IS NULL) AND added_by LIKE ?))")
+                 "AND ("
+                 "  assigned_to LIKE ? "
+                 "  OR (COALESCE(assigned_to,'')='' AND COALESCE(assigned_to_uid,'')='' AND added_by LIKE ?)"
+                 ")")
             params=[cid, "%"+name+"%", "%"+name+"%"]
         else:
             sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending'"
@@ -195,11 +203,15 @@ def set_due_date(tid, due):
 
 # ── Task CRUD ────────────────────────────────────────────────
 def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
+    # ถ้าไม่ได้ assign ใคร → ผู้รับผิดชอบ = คนสร้างเอง
+    if not assigned_to:
+        assigned_to = by
+        assigned_to_uid = by_uid
     with get_db() as c:
         cur = c.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_uid) VALUES(?,?,?,?,?,?)",(cid,title.strip(),by,by_uid,assigned_to,assigned_to_uid))
     tid = cur.lastrowid
     detail = "สร้างงาน: {}".format(title.strip())
-    if assigned_to: detail += " → มอบหมายให้ {}".format(assigned_to)
+    if assigned_to and assigned_to != by: detail += " → มอบหมายให้ {}".format(assigned_to)
     log_activity(tid, cid, by, by_uid, "created", detail)
     return get_task(tid)
 
