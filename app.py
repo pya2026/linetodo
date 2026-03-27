@@ -202,6 +202,11 @@ def task_page_url(tid):
     if APP_URL: return APP_URL.rstrip("/")+"/liff/task?task_id={}".format(tid)
     return None
 
+def summary_page_url(cid):
+    if LIFF_ID: return "https://liff.line.me/{}?chat_id={}".format(LIFF_ID, cid)
+    if APP_URL: return APP_URL.rstrip("/")+"/liff/summary?chat_id={}".format(cid)
+    return None
+
 # ── Flex Cards ───────────────────────────────────────────────
 def build_mini_card(task, idx):
     tid = task["id"]; cc = len(get_comments(tid)); by = task.get("added_by","") or "-"
@@ -322,36 +327,34 @@ def build_list_flex(cid):
         return build_task_flex(p[0]["id"])
     return aqr({"type":"flex","altText":"📋 งานค้าง {} งาน".format(len(p)),"contents":{"type":"carousel","contents":[build_mini_card(t,i) for i,t in enumerate(p[:10],1)]}})
 
-# ── Summary with checkboxes ─────────────────────────────────
+# ── Summary with interactive link ─────────────────────────────
 def build_summary(cid):
     now=datetime.now(); done=get_completed_today(cid); pend=get_pending_tasks(cid)
     di=[{"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True} for t in done] or [{"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"}]
-    # pending items with done+delete buttons — direct action, no confirm
     pi=[]
     for i,t in enumerate(pend,1):
-        pi.append({"type":"box","layout":"horizontal","contents":[
-            {"type":"button","action":{"type":"postback","label":"☑️","data":"action=done_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center"},
-            {"type":"text","text":"{}. {}".format(i,t["title"]),"size":"xs","color":"#FF6B35","wrap":True,"flex":5,"gravity":"center","margin":"sm"},
-            {"type":"button","action":{"type":"postback","label":"🗑️","data":"action=delete_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center","margin":"sm"},
-        ],"margin":"sm"})
+        pi.append({"type":"text","text":"  {}. {}".format(i,t["title"]),"size":"xs","color":"#FF6B35","wrap":True})
     if not pi: pi.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
     if done and not pend: st,sc="🏆 ยอดเยี่ยม!","#1DB446"
     elif done: st,sc="👍 เสร็จ {} ค้าง {}".format(len(done),len(pend)),"#FF8C00"
     else: st,sc="💪 พรุ่งนี้สู้ใหม่!","#FF6B35"
+    su=summary_page_url(cid)
+    footer_contents=[{"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","align":"center"}]
+    if su and pend:
+        footer_contents.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#1DB446","height":"sm","margin":"lg"})
+    body_contents=[
+        {"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(done)),"weight":"bold","size":"sm","color":"#1DB446"},
+    ]+di+[
+        {"type":"separator","margin":"lg"},
+        {"type":"text","text":"⏳ งานค้าง ({})".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"lg"},
+    ]+pi
     return aqr({"type":"flex","altText":"📊 สรุป","contents":{"type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","contents":[
             {"type":"text","text":"📊 สรุปประจำวัน","weight":"bold","size":"lg","color":"#333333"},
             {"type":"text","text":now.strftime("%d/%m/%Y"),"size":"sm","color":"#999999"},
         ],"paddingAll":"15px","backgroundColor":"#FFF9E6"},
-        "body":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(done)),"weight":"bold","size":"sm","color":"#1DB446"},
-        ]+di+[
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"⏳ งานค้าง ({}) — กด ☑️ เสร็จ / 🗑️ ลบ".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"lg"},
-        ]+pi+[
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","margin":"lg","align":"center"},
-        ],"paddingAll":"15px","spacing":"sm"}}})
+        "body":{"type":"box","layout":"vertical","contents":body_contents,"paddingAll":"15px","spacing":"sm"},
+        "footer":{"type":"box","layout":"vertical","contents":footer_contents,"paddingAll":"12px"}}})
 
 def build_clockin(cid):
     now=datetime.now(); pend=get_pending_tasks(cid)
@@ -667,6 +670,26 @@ def api_upload():
     f.save(fpath)
     return jsonify({"url":"/uploads/"+fname})
 
+@app.route("/api/pending/<path:cid>")
+def api_pending(cid):
+    pend=get_pending_tasks(cid); done=get_completed_today(cid)
+    return jsonify({"pending":[dict(t) for t in pend],"done_today":[dict(t) for t in done]})
+
+@app.route("/api/batch-action",methods=["POST"])
+def api_batch():
+    d=request.get_json() or {}
+    author=d.get("author",""); author_uid=d.get("author_uid","")
+    results={"done":[],"deleted":[],"errors":[]}
+    for tid in d.get("done_ids",[]):
+        t=complete_task(int(tid),author,author_uid)
+        if t: results["done"].append(t["title"])
+        else: results["errors"].append(str(tid))
+    for tid in d.get("delete_ids",[]):
+        t=delete_task(int(tid),author,author_uid)
+        if t: results["deleted"].append(t["title"])
+        else: results["errors"].append(str(tid))
+    return jsonify({"ok":True,"results":results})
+
 @app.route("/api/members/<path:cid>")
 def api_members(cid):
     with get_db() as c:
@@ -676,6 +699,131 @@ def api_members(cid):
 # ══════════════════════════════════════════════════════════════
 # Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
+SUMMARY_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>สรุปงาน</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f5;padding-bottom:80px}
+.hdr{background:linear-gradient(135deg,#1DB446,#17a03d);color:#fff;padding:18px 16px;text-align:center}
+.hdr h1{font-size:18px;font-weight:700}.hdr p{font-size:13px;opacity:.85;margin-top:4px}
+.sec{padding:10px 14px 4px;font-size:14px;font-weight:700;color:#333}
+.done-sec{color:#1DB446}.pend-sec{color:#FF6B35}
+.card{background:#fff;margin:6px 14px;border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:all .2s}
+.card.sel-done{background:#E8F5E9;border-left:4px solid #1DB446}
+.card.sel-del{background:#FFEBEE;border-left:4px solid #E53935}
+.card .title{flex:1;font-size:14px;color:#333}
+.card.sel-del .title{text-decoration:line-through;color:#999}
+.card .by{font-size:11px;color:#999;margin-top:2px}
+.btn-grp{display:flex;gap:6px}
+.btn-grp button{width:36px;height:36px;border-radius:50%;border:2px solid #ddd;background:#fff;font-size:16px;cursor:pointer;transition:all .15s}
+.btn-grp button.act-done{border-color:#1DB446;background:#1DB446;color:#fff}
+.btn-grp button.act-del{border-color:#E53935;background:#E53935;color:#fff}
+.done-item{background:#fff;margin:4px 14px;border-radius:8px;padding:10px 14px;font-size:13px;color:#1DB446}
+.done-item span{margin-right:6px}
+.bar{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid #eee;padding:12px 16px;display:flex;gap:10px;align-items:center;z-index:99}
+.bar .info{flex:1;font-size:13px;color:#666}
+.bar .info b{color:#333}
+.bar button{padding:10px 24px;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;color:#fff}
+.bar .confirm-btn{background:#1DB446}.bar .confirm-btn:disabled{background:#ccc}
+.bar .clear-btn{background:#999;padding:10px 16px}
+.empty{text-align:center;padding:30px;color:#999;font-size:14px}
+.result{text-align:center;padding:40px 20px}
+.result .icon{font-size:48px}.result h2{margin:12px 0 8px;font-size:18px}
+.result p{font-size:13px;color:#666}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;display:none;z-index:999}
+</style></head>
+<body>
+<div class="hdr"><h1>📊 สรุปประจำวัน</h1><p id="dateText"></p></div>
+<div id="main"></div>
+<div class="bar" id="actionBar" style="display:none">
+  <div class="info" id="barInfo"></div>
+  <button class="clear-btn" onclick="clearAll()">ล้าง</button>
+  <button class="confirm-btn" id="confirmBtn" onclick="confirmAll()">ยืนยัน</button>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var API="",chatId,selections={},tasks=[];
+function init(){
+  var sp=new URLSearchParams(location.search);
+  chatId=sp.get("chat_id");
+  if(!chatId){var ls=sp.get("liff.state");if(ls){chatId=new URLSearchParams(ls.replace(/^\\?/,"")).get("chat_id")}}
+  if(!chatId){document.getElementById("main").innerHTML='<div class="empty">ไม่มี chat_id</div>';return}
+  var d=new Date();document.getElementById("dateText").textContent=d.toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
+  load();
+}
+async function load(){
+  try{
+    var r=await fetch(API+"/api/pending/"+encodeURIComponent(chatId));
+    if(!r.ok)throw new Error("load fail");
+    var d=await r.json();tasks=d.pending;
+    render(d.done_today,d.pending);
+  }catch(e){document.getElementById("main").innerHTML='<div class="empty">โหลดไม่ได้: '+e.message+'</div>'}
+}
+function render(done,pend){
+  var h='<div class="sec done-sec">✅ เสร็จวันนี้ ('+done.length+')</div>';
+  if(done.length==0)h+='<div class="done-item"><span>—</span> ยังไม่มี</div>';
+  else done.forEach(function(t){h+='<div class="done-item"><span>✔️</span>'+esc(t.title)+'</div>'});
+  h+='<div class="sec pend-sec">⏳ งานค้าง ('+pend.length+')</div>';
+  if(pend.length==0)h+='<div class="empty">🎉 ไม่มีงานค้าง!</div>';
+  else pend.forEach(function(t,i){
+    var cls="card";var sel=selections[t.id];
+    if(sel=="done")cls+=" sel-done";else if(sel=="delete")cls+=" sel-del";
+    h+='<div class="'+cls+'" id="card-'+t.id+'">';
+    h+='<div style="flex:1"><div class="title">'+(i+1)+'. '+esc(t.title)+'</div><div class="by">สั่งโดย: '+(t.added_by||"-")+'</div></div>';
+    h+='<div class="btn-grp">';
+    h+='<button onclick="toggle('+t.id+',\'done\')" class="'+(sel=="done"?"act-done":"")+'">✓</button>';
+    h+='<button onclick="toggle('+t.id+',\'delete\')" class="'+(sel=="delete"?"act-del":"")+'">✕</button>';
+    h+='</div></div>'});
+  document.getElementById("main").innerHTML=h;
+  updateBar();
+}
+function toggle(tid,action){
+  if(selections[tid]==action)delete selections[tid];else selections[tid]=action;
+  var card=document.getElementById("card-"+tid);
+  card.className="card"+(selections[tid]=="done"?" sel-done":selections[tid]=="delete"?" sel-del":"");
+  var btns=card.querySelectorAll(".btn-grp button");
+  btns[0].className=selections[tid]=="done"?"act-done":"";
+  btns[1].className=selections[tid]=="delete"?"act-del":"";
+  updateBar();
+}
+function updateBar(){
+  var doneIds=[],delIds=[];
+  for(var k in selections){if(selections[k]=="done")doneIds.push(k);else delIds.push(k)}
+  var total=doneIds.length+delIds.length;
+  var bar=document.getElementById("actionBar");
+  if(total==0){bar.style.display="none";return}
+  bar.style.display="flex";
+  var info="";
+  if(doneIds.length>0)info+='<b style="color:#1DB446">✅ เสร็จ '+doneIds.length+'</b> ';
+  if(delIds.length>0)info+='<b style="color:#E53935">🗑️ ลบ '+delIds.length+'</b>';
+  document.getElementById("barInfo").innerHTML=info;
+}
+function clearAll(){selections={};load()}
+async function confirmAll(){
+  var doneIds=[],delIds=[];
+  for(var k in selections){if(selections[k]=="done")doneIds.push(parseInt(k));else delIds.push(parseInt(k))}
+  if(doneIds.length+delIds.length==0)return;
+  document.getElementById("confirmBtn").disabled=true;document.getElementById("confirmBtn").textContent="กำลังทำ...";
+  try{
+    var r=await fetch(API+"/api/batch-action",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({done_ids:doneIds,delete_ids:delIds,author:"ผู้ใช้",author_uid:""})});
+    if(!r.ok)throw new Error("fail");
+    var d=await r.json();
+    var msg='<div class="result"><div class="icon">✅</div><h2>จัดการเรียบร้อย!</h2>';
+    if(d.results.done.length>0)msg+='<p style="color:#1DB446">เสร็จ: '+d.results.done.join(", ")+'</p>';
+    if(d.results.deleted.length>0)msg+='<p style="color:#E53935">ลบแล้ว: '+d.results.deleted.join(", ")+'</p>';
+    msg+='<p style="margin-top:16px;color:#999">กำลังกลับไปแชท...</p></div>';
+    document.getElementById("main").innerHTML=msg;
+    document.getElementById("actionBar").style.display="none";
+    setTimeout(function(){location.href="https://line.me/R/"},1500);
+  }catch(e){toast("ทำไม่ได้ ลองใหม่");document.getElementById("confirmBtn").disabled=false;document.getElementById("confirmBtn").textContent="ยืนยัน"}
+}
+function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML}
+function toast(m){var t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(function(){t.style.display="none"},2500)}
+init();
+</script></body></html>"""
+
 TASK_PAGE_HTML = """<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Task Detail</title>
@@ -870,7 +1018,15 @@ init();
 
 @app.route("/liff/task")
 def task_page():
+    # LIFF always redirects to /liff/task — detect chat_id in liff.state to route to summary
+    ls = request.args.get("liff.state","")
+    if "chat_id=" in ls and "task_id" not in ls:
+        return SUMMARY_PAGE_HTML
     return TASK_PAGE_HTML
+
+@app.route("/liff/summary")
+def summary_page():
+    return SUMMARY_PAGE_HTML
 
 # ── Scheduled Summary ────────────────────────────────────────
 def send_daily():
