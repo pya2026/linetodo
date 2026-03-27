@@ -12,7 +12,7 @@ from contextlib import contextmanager
 
 import requests
 from flask import Flask, request, abort, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
+# APScheduler removed — ใช้ เข้างาน/เลิกงาน แทน auto summary
 
 app = Flask(__name__)
 
@@ -105,6 +105,46 @@ def get_pending(uid, cid):
 def clear_pending(uid, cid):
     with get_db() as c: c.execute("DELETE FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
 
+# ── Due Date Parser ──────────────────────────────────────────
+def parse_due_date(text):
+    """แยก due date ออกจาก text — format: วันที่ + งาน เช่น 'พรุ่งนี้ ส่งรายงาน' หรือ '30/03 ส่งเอกสาร'"""
+    from datetime import timedelta
+    today=datetime.now().date()
+    # พรุ่งนี้/มะรืน
+    m=re.match(r'^(พรุ่งนี้|มะรืน|วันนี้|tomorrow|today)\s+(.+)',text,re.I)
+    if m:
+        w=m.group(1).lower()
+        if w in ["พรุ่งนี้","tomorrow"]: d=today+timedelta(days=1)
+        elif w in ["มะรืน"]: d=today+timedelta(days=2)
+        else: d=today
+        return d.strftime("%Y-%m-%d"), m.group(2).strip()
+    # dd/mm หรือ dd/mm/yyyy
+    m=re.match(r'^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\s+(.+)',text)
+    if m:
+        dd,mm=int(m.group(1)),int(m.group(2))
+        yy=int(m.group(3)) if m.group(3) else today.year
+        if yy<100: yy+=2000
+        try:
+            from datetime import date
+            d=date(yy,mm,dd)
+            return d.strftime("%Y-%m-%d"), m.group(4).strip()
+        except: pass
+    # จันทร์/อังคาร/... หน้า
+    days_th={"จันทร์":0,"อังคาร":1,"พุธ":2,"พฤหัส":3,"พฤหัสบดี":3,"ศุกร์":4,"เสาร์":5,"อาทิตย์":6}
+    m=re.match(r'^(จันทร์|อังคาร|พุธ|พฤหัส|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์)\s+(.+)',text)
+    if m:
+        target=days_th[m.group(1)]
+        current=today.weekday()
+        diff=(target-current)%7
+        if diff==0: diff=7
+        d=today+timedelta(days=diff)
+        return d.strftime("%Y-%m-%d"), m.group(2).strip()
+    return None, text
+
+def set_due_date(tid, due):
+    with get_db() as c:
+        c.execute("UPDATE tasks SET due_date=? WHERE id=?",(due,tid))
+
 # ── Task CRUD ────────────────────────────────────────────────
 def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
     with get_db() as c:
@@ -190,8 +230,8 @@ def qr():
     return {"items":[
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
         {"type":"action","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list","displayText":"📋 ดูงาน"}},
-        {"type":"action","action":{"type":"postback","label":"📊 สรุป","data":"action=summary","displayText":"📊 สรุป"}},
         {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
+        {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -362,29 +402,112 @@ def build_summary(cid):
         "body":{"type":"box","layout":"vertical","contents":body_contents,"paddingAll":"15px","spacing":"sm"},
         "footer":{"type":"box","layout":"vertical","contents":footer_contents,"paddingAll":"12px"}}})
 
+def get_tasks_by_person(cid):
+    """แยกงานตามคน — ดูจาก assigned_to ถ้าไม่มีใช้ added_by"""
+    pend=get_pending_tasks(cid)
+    by_person={}
+    for t in pend:
+        person=t.get("assigned_to","") or t.get("added_by","") or "ไม่ระบุ"
+        by_person.setdefault(person,[]).append(t)
+    return pend, by_person
+
+def get_today_tasks(cid):
+    """งานที่ due วันนี้ + งานค้างที่ไม่มี due"""
+    today=datetime.now().strftime("%Y-%m-%d")
+    pend=get_pending_tasks(cid)
+    today_tasks=[t for t in pend if t.get("due_date")==today]
+    no_due=[t for t in pend if not t.get("due_date")]
+    overdue=[t for t in pend if t.get("due_date") and t["due_date"]<today]
+    future=[t for t in pend if t.get("due_date") and t["due_date"]>today]
+    return today_tasks, no_due, overdue, future
+
 def build_clockin(cid):
-    now=datetime.now(); pend=get_pending_tasks(cid)
-    items=[]
-    for i,t in enumerate(pend,1):
-        items.append({"type":"box","layout":"horizontal","contents":[
-            {"type":"text","text":"{}".format(i),"size":"sm","color":"#1DB446","flex":0,"weight":"bold"},
-            {"type":"text","text":"⬜ {}".format(t["title"]),"size":"sm","wrap":True,"margin":"md"}],"margin":"md"})
-    if not items: items.append({"type":"text","text":"🎉 ไม่มีงานค้าง!","size":"sm","color":"#1DB446"})
-    return aqr({"type":"flex","altText":"🌅 เข้างาน","contents":{"type":"bubble",
+    now=datetime.now()
+    today_tasks, no_due, overdue, future = get_today_tasks(cid)
+    pend, by_person = get_tasks_by_person(cid)
+    # สร้าง body content
+    body=[]
+    # งาน overdue
+    if overdue:
+        body.append({"type":"text","text":"🔴 งานเลยกำหนด ({})".format(len(overdue)),"weight":"bold","size":"sm","color":"#E53935","margin":"md"})
+        for t in overdue:
+            who=t.get("assigned_to","") or t.get("added_by","") or "-"
+            body.append({"type":"text","text":"  ⚠️ {} (📌{})".format(t["title"],who),"size":"xs","color":"#E53935","wrap":True})
+        body.append({"type":"separator","margin":"md"})
+    # งานวันนี้
+    body.append({"type":"text","text":"📋 งานวันนี้ ({})".format(len(today_tasks)+len(no_due)),"weight":"bold","size":"sm","color":"#1DB446","margin":"md"})
+    all_today=today_tasks+no_due
+    if not all_today:
+        body.append({"type":"text","text":"  — ไม่มีงานวันนี้ 🎉","size":"xs","color":"#999"})
+    for t in all_today:
+        who=t.get("assigned_to","") or t.get("added_by","") or "-"
+        body.append({"type":"text","text":"  ⬜ {} (📌{})".format(t["title"],who),"size":"xs","color":"#333","wrap":True})
+    # งานค้างแยกตามคน
+    body.append({"type":"separator","margin":"lg"})
+    body.append({"type":"text","text":"👥 งานค้างแต่ละคน ({} งาน)".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"md"})
+    for person, tasks in by_person.items():
+        body.append({"type":"text","text":"  👤 {} — {} งาน".format(person, len(tasks)),"size":"xs","color":"#FF6B35","weight":"bold","margin":"sm"})
+        for t in tasks[:3]:
+            body.append({"type":"text","text":"     ⬜ {}".format(t["title"]),"size":"xs","color":"#666","wrap":True})
+        if len(tasks)>3:
+            body.append({"type":"text","text":"     ...อีก {} งาน".format(len(tasks)-3),"size":"xs","color":"#999"})
+    # future tasks
+    if future:
+        body.append({"type":"separator","margin":"lg"})
+        body.append({"type":"text","text":"📅 งานที่กำหนดไว้ ({})".format(len(future)),"weight":"bold","size":"sm","color":"#1976D2","margin":"md"})
+        for t in future[:5]:
+            dd=t.get("due_date","")
+            try: dd=datetime.strptime(dd,"%Y-%m-%d").strftime("%d/%m")
+            except: pass
+            body.append({"type":"text","text":"  📆 {} — {}".format(dd,t["title"]),"size":"xs","color":"#1976D2","wrap":True})
+    su=summary_page_url(cid)
+    footer_c=[{"type":"text","text":"💪 สู้ๆ วันนี้!","size":"sm","color":"#1DB446","align":"center","weight":"bold"}]
+    if su and pend:
+        footer_c.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#1DB446","height":"sm","margin":"lg"})
+    return aqr({"type":"flex","altText":"🌅 เข้างาน","contents":{"type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"🌅 สวัสดีตอนเช้า!","weight":"bold","size":"lg","color":"#1DB446"},
+            {"type":"text","text":"🌅 เข้างาน!","weight":"bold","size":"lg","color":"#1DB446"},
             {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
         ],"paddingAll":"15px","backgroundColor":"#F5FFF5"},
-        "body":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"📋 งานวันนี้ ({} งาน)".format(len(pend)),"weight":"bold","size":"sm"},
-            {"type":"separator","margin":"md"}]+items+[
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"💪 สู้ๆ นะครับ!","size":"sm","color":"#1DB446","margin":"lg","align":"center"}
-        ],"paddingAll":"15px"},
-        "footer":{"type":"box","layout":"horizontal","contents":[
-            {"type":"button","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list"},"style":"primary","height":"sm","color":"#1DB446"},
-            {"type":"button","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt"},"style":"secondary","height":"sm","margin":"sm"}
-        ],"paddingAll":"10px"}}})
+        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
+        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"12px"}}})
+
+def build_clockout(cid):
+    now=datetime.now(); done=get_completed_today(cid); pend=get_pending_tasks(cid)
+    pend_all, by_person = get_tasks_by_person(cid)
+    body=[]
+    # สรุปงานที่เสร็จวันนี้
+    body.append({"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(done)),"weight":"bold","size":"sm","color":"#1DB446"})
+    if done:
+        for t in done:
+            who=t.get("assigned_to","") or t.get("added_by","") or "-"
+            body.append({"type":"text","text":"  ✔️ {} (📌{})".format(t["title"],who),"size":"xs","color":"#1DB446","wrap":True})
+    else:
+        body.append({"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999"})
+    # งานค้างแยกตามคน
+    body.append({"type":"separator","margin":"lg"})
+    body.append({"type":"text","text":"⏳ งานค้าง ({})".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"md"})
+    if by_person:
+        for person, tasks in by_person.items():
+            body.append({"type":"text","text":"  👤 {} — {} งาน".format(person, len(tasks)),"size":"xs","color":"#FF6B35","weight":"bold","margin":"sm"})
+            for t in tasks[:3]:
+                body.append({"type":"text","text":"     ⬜ {}".format(t["title"]),"size":"xs","color":"#666","wrap":True})
+            if len(tasks)>3:
+                body.append({"type":"text","text":"     ...อีก {} งาน".format(len(tasks)-3),"size":"xs","color":"#999"})
+    else:
+        body.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
+    # สถานะ
+    if done and not pend: st,sc="🏆 ยอดเยี่ยม! เคลียร์หมดแล้ว","#1DB446"
+    elif done: st,sc="👍 เสร็จ {} ค้าง {}".format(len(done),len(pend)),"#FF8C00"
+    else: st,sc="💪 พรุ่งนี้สู้ใหม่!","#FF6B35"
+    body.append({"type":"separator","margin":"lg"})
+    body.append({"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","margin":"md","align":"center"})
+    return aqr({"type":"flex","altText":"🌆 เลิกงาน","contents":{"type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","contents":[
+            {"type":"text","text":"🌆 เลิกงาน!","weight":"bold","size":"lg","color":"#FF6B35"},
+            {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
+        ],"paddingAll":"15px","backgroundColor":"#FFF3E0"},
+        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"}}})
 
 def build_help():
     return aqr({"type":"flex","altText":"📖 วิธีใช้","contents":{"type":"bubble",
@@ -416,12 +539,13 @@ def build_help():
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"📋 งานของฉัน → ดูงานที่มอบหมายให้","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"separator","margin":"lg"},
-            {"type":"text","text":"⏰ auto สรุปทุกวัน 18:00","size":"xs","color":"#999999","margin":"lg","align":"center"},
+            {"type":"text","text":"🌅 เข้างาน / 🌆 เลิกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"เข้างาน → ดูงานวันนี้ / เลิกงาน → สรุปผล","size":"xs","color":"#666666","margin":"sm"},
         ],"paddingAll":"15px"}}})
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu","มอบหมาย","assign"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -441,19 +565,26 @@ def process_text(text, cid, uid="", name=""):
                 return aqr("❌ ไม่พบงานนี้")
 
     if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid)
+    if tl in ["เลิกงาน","clock out","สรุป","summary"]: return build_clockout(cid)
     m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
     if m:
         raw=m.group(1).strip()
-        # Split by comma, newline, or numbered list (1. 2. 3. or 1) 2) 3))
         items=re.split(r'[,\n]+', raw)
         items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in items]
         items=[x for x in items if x]
         if len(items)>1:
             added=[]
-            for it in items: t=add_task(cid,it,by=name,by_uid=uid); added.append(t)
+            for it in items:
+                due,title=parse_due_date(it)
+                t=add_task(cid,title,by=name,by_uid=uid)
+                if due: set_due_date(t["id"],due)
+                added.append(get_task(t["id"]))
             cards=[build_mini_card(t,i) for i,t in enumerate(added,1)]
             return aqr({"type":"flex","altText":"➕ เพิ่ม {} งาน".format(len(added)),"contents":{"type":"carousel","contents":cards[:10]}})
-        t=add_task(cid,items[0] if items else raw,by=name,by_uid=uid); return build_task_flex(t["id"])
+        due,title=parse_due_date(items[0] if items else raw)
+        t=add_task(cid,title,by=name,by_uid=uid)
+        if due: set_due_date(t["id"],due)
+        return build_task_flex(t["id"])
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
     # @ชื่อ เพิ่ม งาน1,งาน2 → มอบหมายงานให้คนอื่น
@@ -469,8 +600,10 @@ def process_text(text, cid, uid="", name=""):
         items=[x for x in items if x]
         added=[]
         for it in items:
-            t=add_task(cid,it,by=name,by_uid=uid,assigned_to=aname,assigned_to_uid=auid)
-            added.append(t)
+            due,title=parse_due_date(it)
+            t=add_task(cid,title,by=name,by_uid=uid,assigned_to=aname,assigned_to_uid=auid)
+            if due: set_due_date(t["id"],due)
+            added.append(get_task(t["id"]))
         if len(added)==1:
             return aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(added[0]["title"],aname))
         return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
@@ -1102,11 +1235,7 @@ def summary_page():
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
-# ── Scheduled Summary ────────────────────────────────────────
-def send_daily():
-    for cid in get_active_chats():
-        try: push_msg(cid, build_summary(cid))
-        except Exception as e: app.logger.error("Sum err %s: %s",cid,e)
+# (auto summary removed)
 
 @app.route("/uploads/<path:fname>")
 def serve_upload(fname):
@@ -1118,9 +1247,6 @@ def serve_upload(fname):
 def health(): return "LINE Todo Bot v6 running!"
 
 init_db()
-sched = BackgroundScheduler(timezone="Asia/Bangkok")
-sched.add_job(send_daily, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
-sched.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
