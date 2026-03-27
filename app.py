@@ -60,8 +60,8 @@ def init_db():
             title TEXT NOT NULL, added_by TEXT DEFAULT '', added_by_user_id TEXT DEFAULT '',
             status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             completed_at DATETIME, due_date DATE)""")
-        for col in ["added_by_user_id"]:
-            try: c.execute("ALTER TABLE tasks ADD COLUMN {} TEXT DEFAULT ''".format(col))
+        for col in ["added_by_user_id","assigned_to TEXT DEFAULT ''","assigned_to_uid TEXT DEFAULT ''"]:
+            try: c.execute("ALTER TABLE tasks ADD COLUMN {}".format(col if ' ' in col else col+" TEXT DEFAULT ''"))
             except: pass
         c.execute("""CREATE TABLE IF NOT EXISTS comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
@@ -106,11 +106,13 @@ def clear_pending(uid, cid):
     with get_db() as c: c.execute("DELETE FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
 
 # ── Task CRUD ────────────────────────────────────────────────
-def add_task(cid, title, by="", by_uid=""):
+def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
     with get_db() as c:
-        cur = c.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id) VALUES(?,?,?,?)",(cid,title.strip(),by,by_uid))
+        cur = c.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_uid) VALUES(?,?,?,?,?,?)",(cid,title.strip(),by,by_uid,assigned_to,assigned_to_uid))
     tid = cur.lastrowid
-    log_activity(tid, cid, by, by_uid, "created", "สร้างงาน: {}".format(title.strip()))
+    detail = "สร้างงาน: {}".format(title.strip())
+    if assigned_to: detail += " → มอบหมายให้ {}".format(assigned_to)
+    log_activity(tid, cid, by, by_uid, "created", detail)
     return get_task(tid)
 
 def get_task(tid):
@@ -254,6 +256,11 @@ def build_full_card(task):
         {"type":"box","layout":"horizontal","contents":[
             {"type":"text","text":"เมื่อ:","size":"xs","color":"#888888","flex":2},
             {"type":"text","text":ca or "-","size":"xs","color":"#333333","flex":5}],"margin":"sm"}]
+    assigned=task.get("assigned_to","")
+    if assigned:
+        body.append({"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":"👤 มอบหมาย:","size":"xs","color":"#888888","flex":2},
+            {"type":"text","text":assigned,"size":"xs","color":"#FF6B35","flex":5,"weight":"bold"}],"margin":"sm"})
     comments=get_comments(tid)
     body.append({"type":"separator","margin":"lg"})
     body.append({"type":"text","text":"💬 ความคิดเห็น ({})".format(len(comments)),"size":"sm","weight":"bold","color":"#1DB446","margin":"lg"})
@@ -397,12 +404,21 @@ def build_help():
             {"type":"text","text":"📋 Activity Log ทุกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"ดูย้อนหลังว่าใครทำอะไรเมื่อไหร่","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"📌 มอบหมาย @ชื่อ ชื่องาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"เช่น: มอบหมาย @สมชาย ส่งรายงาน","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"➕ เพิ่มหลายงานทีเดียว","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"เช่น: เพิ่ม งาน1,งาน2,งาน3","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"📋 งานของฉัน → ดูงานที่มอบหมายให้","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"separator","margin":"lg"},
             {"type":"text","text":"⏰ auto สรุปทุกวัน 18:00","size":"xs","color":"#999999","margin":"lg","align":"center"},
         ],"paddingAll":"15px"}}})
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu","มอบหมาย","assign"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -422,11 +438,50 @@ def process_text(text, cid, uid="", name=""):
                 return aqr("❌ ไม่พบงานนี้")
 
     if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid)
-    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I)
-    if m: t=add_task(cid,m.group(1).strip(),by=name,by_uid=uid); return build_task_flex(t["id"])
+    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
+    if m:
+        raw=m.group(1).strip()
+        # Split by comma, newline, or numbered list (1. 2. 3. or 1) 2) 3))
+        items=re.split(r'[,\n]+', raw)
+        items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in items]
+        items=[x for x in items if x]
+        if len(items)>1:
+            added=[]
+            for it in items: t=add_task(cid,it,by=name,by_uid=uid); added.append(t)
+            cards=[build_mini_card(t,i) for i,t in enumerate(added,1)]
+            return aqr({"type":"flex","altText":"➕ เพิ่ม {} งาน".format(len(added)),"contents":{"type":"carousel","contents":cards[:10]}})
+        t=add_task(cid,items[0] if items else raw,by=name,by_uid=uid); return build_task_flex(t["id"])
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
+    # มอบหมาย @ชื่อ งาน หรือ มอบหมาย ชื่อ งาน
+    am=re.match(r"^(?:มอบหมาย|assign)\s+@?(\S+)\s+(.+)",ts,re.I|re.S)
+    if am:
+        aname=am.group(1).strip(); atitle=am.group(2).strip()
+        # Find member by name
+        auid=""
+        with get_db() as c:
+            mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+aname+"%")).fetchone()
+            if mr: aname=mr["display_name"]; auid=mr["user_id"]
+        items=re.split(r'[,\n]+', atitle)
+        items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in items]
+        items=[x for x in items if x]
+        added=[]
+        for it in items:
+            t=add_task(cid,it,by=name,by_uid=uid,assigned_to=aname,assigned_to_uid=auid)
+            added.append(t)
+        if len(added)==1:
+            return aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(added[0]["title"],aname))
+        return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
+    if tl in ["มอบหมาย","assign"]:
+        return aqr("📌 วิธีใช้: มอบหมาย @ชื่อ ชื่องาน\nเช่น: มอบหมาย @สมชาย ส่งรายงาน,เตรียมเอกสาร")
     if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
+    # ดูงานของฉัน
+    if tl in ["งานฉัน","งานของฉัน","my tasks","mytasks"]:
+        with get_db() as c:
+            my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_uid=? ORDER BY created_at",(cid,uid)).fetchall()
+        if not my: return aqr("🎉 ไม่มีงานที่มอบหมายให้คุณ!")
+        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
+        return aqr({"type":"flex","altText":"📋 งานของฉัน {} งาน".format(len(my)),"contents":{"type":"carousel","contents":cards[:10]}})
 
     # log command
     m=re.match(r"^(?:log|ประวัติ)\s*(\d+)",ts,re.I)
@@ -861,7 +916,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .arow{display:flex;gap:6px}
 .abtn{flex:1;padding:11px;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;text-align:center}
 .a-done{background:#E8F5E9;color:#1DB446}.a-ask{background:#FFF3E0;color:#E65100;border:1px solid #FFB74D}.a-del{background:#FFEBEE;color:#E53935}
-.cbar{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #eee;padding:8px 12px;display:flex;gap:8px;background:#fff;z-index:20}
+.cbar{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #eee;padding:8px 12px;display:flex;gap:8px;background:#fff;z-index:20;transition:bottom .15s}
 .cbar input{flex:1;padding:9px 14px;border:1.5px solid #ddd;border-radius:22px;font-size:13px;outline:none}.cbar input:focus{border-color:#1DB446}
 .cbar button{background:#1DB446;color:#fff;border:none;border-radius:50%;width:38px;height:38px;font-size:16px;cursor:pointer}
 .cbar .attach-btn{background:#FF9800;font-size:14px}
@@ -1011,6 +1066,10 @@ function showConfirm(title,msg,onYes){document.getElementById("confirmTitle").te
   document.getElementById("confirmYes").onclick=function(){hideConfirm();onYes()};document.getElementById("confirmOverlay").style.display="flex"}
 function hideConfirm(){document.getElementById("confirmOverlay").style.display="none"}
 function toast(m){var t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(function(){t.style.display="none"},2500)}
+(function(){var ci=document.getElementById("cinput");if(!ci)return;
+ci.addEventListener("focus",function(){setTimeout(function(){ci.scrollIntoView({block:"center",behavior:"smooth"});if(window.visualViewport){document.querySelector(".cbar").style.bottom=(window.innerHeight-window.visualViewport.height)+"px"}},300)});
+ci.addEventListener("blur",function(){document.querySelector(".cbar").style.bottom="0"});
+if(window.visualViewport){window.visualViewport.addEventListener("resize",function(){var cb=document.querySelector(".cbar");if(document.activeElement===ci){cb.style.bottom=(window.innerHeight-window.visualViewport.height)+"px"}else{cb.style.bottom="0"}})}})();
 init();
 </script></body></html>"""
 
