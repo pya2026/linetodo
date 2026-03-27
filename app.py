@@ -405,8 +405,11 @@ def build_help():
             {"type":"text","text":"ดูย้อนหลังว่าใครทำอะไรเมื่อไหร่","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
             {"type":"separator","margin":"lg"},
-            {"type":"text","text":"📌 มอบหมาย @ชื่อ ชื่องาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"เช่น: มอบหมาย @สมชาย ส่งรายงาน","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"text","text":"📌 @ชื่อ เพิ่ม ชื่องาน → มอบหมาย","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"เช่น: @สมชาย เพิ่ม ส่งรายงาน,เตรียมเอกสาร","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"📌 @ชื่อ งาน → เช็คงานของคนนั้น","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"เช่น: @สมชาย งาน","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"➕ เพิ่มหลายงานทีเดียว","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"เช่น: เพิ่ม งาน1,งาน2,งาน3","size":"xs","color":"#666666","margin":"sm"},
@@ -453,11 +456,10 @@ def process_text(text, cid, uid="", name=""):
         t=add_task(cid,items[0] if items else raw,by=name,by_uid=uid); return build_task_flex(t["id"])
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
-    # มอบหมาย @ชื่อ งาน หรือ มอบหมาย ชื่อ งาน
-    am=re.match(r"^(?:มอบหมาย|assign)\s+@?(\S+)\s+(.+)",ts,re.I|re.S)
+    # @ชื่อ เพิ่ม งาน1,งาน2 → มอบหมายงานให้คนอื่น
+    am=re.match(r"^@(\S+)\s+(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
     if am:
         aname=am.group(1).strip(); atitle=am.group(2).strip()
-        # Find member by name
         auid=""
         with get_db() as c:
             mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+aname+"%")).fetchone()
@@ -472,14 +474,27 @@ def process_text(text, cid, uid="", name=""):
         if len(added)==1:
             return aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(added[0]["title"],aname))
         return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
-    if tl in ["มอบหมาย","assign"]:
-        return aqr("📌 วิธีใช้: มอบหมาย @ชื่อ ชื่องาน\nเช่น: มอบหมาย @สมชาย ส่งรายงาน,เตรียมเอกสาร")
+    # @ชื่อ งาน → ดูงานค้างของคนนั้น
+    am2=re.match(r"^@(\S+)\s*(?:งาน|tasks?)?$",ts,re.I)
+    if am2:
+        aname=am2.group(1).strip(); auid=""
+        with get_db() as c:
+            mr=c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?", (cid, "%"+aname+"%")).fetchone()
+            if mr: aname=mr["display_name"]; auid=mr["user_id"]
+            # ดูงานที่ assigned ให้คนนี้ + งานที่คนนี้สร้าง
+            if auid:
+                my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?) ORDER BY created_at",(cid,auid,auid)).fetchall()
+            else:
+                my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to LIKE ? OR added_by LIKE ?) ORDER BY created_at",(cid,"%"+aname+"%","%"+aname+"%")).fetchall()
+        if not my: return aqr("🎉 ไม่มีงานค้างของ {}".format(aname))
+        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
+        return aqr({"type":"flex","altText":"📋 งานของ {} ({} งาน)".format(aname,len(my)),"contents":{"type":"carousel","contents":cards[:10]}})
     if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
     # ดูงานของฉัน
     if tl in ["งานฉัน","งานของฉัน","my tasks","mytasks"]:
         with get_db() as c:
-            my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_uid=? ORDER BY created_at",(cid,uid)).fetchall()
-        if not my: return aqr("🎉 ไม่มีงานที่มอบหมายให้คุณ!")
+            my=c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (assigned_to_uid=? OR added_by_user_id=?) ORDER BY created_at",(cid,uid,uid)).fetchall()
+        if not my: return aqr("🎉 ไม่มีงานของคุณ!")
         cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
         return aqr({"type":"flex","altText":"📋 งานของฉัน {} งาน".format(len(my)),"contents":{"type":"carousel","contents":cards[:10]}})
 
