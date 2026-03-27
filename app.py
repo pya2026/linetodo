@@ -165,29 +165,14 @@ def parse_date_only(text):
     return None
 
 def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
-    """Query pending tasks filtered by ผู้รับผิดชอบ and optional due_date.
-    Logic: ถ้างานมี assigned_to (ชื่อ or uid) → ผู้รับผิดชอบ = assigned_to
-           ถ้างานไม่มี assigned_to เลย → ผู้รับผิดชอบ = added_by (คนสร้าง)
-    """
+    """Query pending tasks — ดูจาก assigned_to เท่านั้น (ผู้รับผิดชอบ)"""
     with get_db() as c:
         if uid:
-            # 1) assigned_to_uid ตรง OR
-            # 2) ไม่มี assigned เลย (ทั้ง uid+name ว่าง) แล้วเป็นคนสร้าง
-            sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
-                 "AND ("
-                 "  assigned_to_uid=? "
-                 "  OR (COALESCE(assigned_to_uid,'')='' AND COALESCE(assigned_to,'')='' AND added_by_user_id=?)"
-                 ")")
-            params=[cid, uid, uid]
+            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_uid=?"
+            params=[cid, uid]
         elif name:
-            # 1) assigned_to ชื่อตรง OR
-            # 2) ไม่มี assigned เลย แล้ว added_by ตรง
-            sql=("SELECT * FROM tasks WHERE chat_id=? AND status='pending' "
-                 "AND ("
-                 "  assigned_to LIKE ? "
-                 "  OR (COALESCE(assigned_to,'')='' AND COALESCE(assigned_to_uid,'')='' AND added_by LIKE ?)"
-                 ")")
-            params=[cid, "%"+name+"%", "%"+name+"%"]
+            sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to LIKE ?"
+            params=[cid, "%"+name+"%"]
         else:
             sql="SELECT * FROM tasks WHERE chat_id=? AND status='pending'"
             params=[cid]
@@ -289,7 +274,8 @@ def get_comments(tid):
 def qr():
     return {"items":[
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
-        {"type":"action","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list","displayText":"📋 ดูงาน"}},
+        {"type":"action","action":{"type":"message","label":"📋 ดูงาน","text":"ดูงาน"}},
+        {"type":"action","action":{"type":"message","label":"👥 งานทุกคน","text":"งานทุกคน"}},
         {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
         {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
@@ -441,6 +427,37 @@ def build_list_flex(cid):
         if lu: return aqr({"type":"flex","altText":"📋 งานค้าง 1 งาน","contents":build_mini_card(p[0],1)})
         return build_task_flex(p[0]["id"])
     return aqr({"type":"flex","altText":"📋 งานค้าง {} งาน".format(len(p)),"contents":{"type":"carousel","contents":[build_mini_card(t,i) for i,t in enumerate(p[:10],1)]}})
+
+def build_all_persons_flex(cid):
+    """งานทุกคน — แยก 1 คน = 1 bubble, carousel"""
+    p=get_pending_tasks(cid)
+    if not p: return aqr("🎉 ไม่มีงานค้างในกลุ่ม!")
+    # Group by ผู้รับผิดชอบ (assigned_to)
+    by_person={}
+    for t in p:
+        person=t.get("assigned_to","") or t.get("added_by","") or "ไม่ระบุ"
+        by_person.setdefault(person,[]).append(t)
+    bubbles=[]
+    colors=["#1DB446","#FF6B35","#5B5EA6","#E91E63","#009688","#FF9800","#795548","#607D8B"]
+    for idx,(person,tasks) in enumerate(by_person.items()):
+        color=colors[idx % len(colors)]
+        task_lines=[]
+        for i,t in enumerate(tasks,1):
+            due=t.get("due_date","")
+            dd=""
+            if due:
+                try: dd=" [📅{}]".format(datetime.strptime(due,"%Y-%m-%d").strftime("%d/%m"))
+                except: pass
+            task_lines.append({"type":"text","text":"{}. {}{}".format(i,t["title"],dd),"size":"sm","color":"#333333","wrap":True,"margin":"sm"})
+        bubble={"type":"bubble","size":"kilo",
+            "header":{"type":"box","layout":"vertical","contents":[
+                {"type":"text","text":"👤 {}".format(person),"weight":"bold","size":"md","color":"#FFFFFF"},
+                {"type":"text","text":"{} งานค้าง".format(len(tasks)),"size":"xs","color":"#FFFFFFCC"}
+            ],"paddingAll":"14px","backgroundColor":color},
+            "body":{"type":"box","layout":"vertical","contents":task_lines[:15],"paddingAll":"12px","spacing":"none"}}
+        bubbles.append(bubble)
+    return aqr({"type":"flex","altText":"📋 งานทุกคน ({} คน, {} งาน)".format(len(by_person),len(p)),
+        "contents":{"type":"carousel","contents":bubbles[:10]}})
 
 # ── Summary with interactive link ─────────────────────────────
 def build_summary(cid):
@@ -608,7 +625,10 @@ def build_help():
             {"type":"text","text":"📅 หลายวัน:","size":"xs","color":"#666666","margin":"sm"},
             {"type":"text","text":"เพิ่ม\\nพรุ่งนี้ งาน1,งาน2\\n30/03 งาน3\\nศุกร์ งาน4","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
-            {"type":"text","text":"📋 งานของฉัน → ดูงานที่มอบหมายให้","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"📋 ดูงาน → งานของฉัน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
+            {"type":"text","text":"📋 งาน@ชื่อ / @ชื่อ งาน → งานคนอื่น","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
+            {"type":"text","text":"📋 งานทุกคน → ดูงานทุกคนในกลุ่ม","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
+            {"type":"text","text":"📊 สรุปงาน / สรุปงาน@ชื่อ","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"🌅 เข้างาน / 🌆 เลิกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"เข้างาน → ดูงานวันนี้ / เลิกงาน → สรุปผล","size":"xs","color":"#666666","margin":"sm"},
@@ -663,7 +683,7 @@ def _parse_and_add_tasks(raw, cid, name, uid, assigned_to="", assigned_to_uid=""
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","งานทุกคน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -777,6 +797,9 @@ def process_text(text, cid, uid="", name=""):
 
     # Pattern: งานค้าง / รายการ — all tasks (no filter)
     if tl in ["งานค้าง","รายการ"]: return build_list_flex(cid)
+
+    # Pattern: งานทุกคน — แยก 1 คน = 1 bubble
+    if tl in ["งานทุกคน","all tasks","alltasks"]: return build_all_persons_flex(cid)
 
     # Pattern: สรุปงาน — MY summary
     if tl in ["สรุปงาน"]:
