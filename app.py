@@ -34,7 +34,13 @@ def reply_msg(tok, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
     r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-    if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
+    if r.status_code!=200:
+        app.logger.error("Reply err: %s %s", r.status_code, r.text)
+        # retry without quickReply in case it causes issues
+        for m in msgs:
+            if "quickReply" in m: del m["quickReply"]
+        r2 = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
+        if r2.status_code!=200: app.logger.error("Retry err: %s %s", r2.status_code, r2.text)
 def push_msg(to, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
@@ -273,11 +279,11 @@ def get_comments(tid):
 # ── Quick Reply ──────────────────────────────────────────────
 def qr():
     return {"items":[
+        {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
+        {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
         {"type":"action","action":{"type":"message","label":"📋 ดูงาน","text":"ดูงาน"}},
         {"type":"action","action":{"type":"message","label":"👥 งานทุกคน","text":"งานทุกคน"}},
-        {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
-        {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -1011,7 +1017,10 @@ def callback():
                 if r: reply_msg(tok,r)
             elif ev.get("type")=="postback":
                 handle_pb(ev.get("postback",{}).get("data",""),cid,tok,uid,name)
-        except Exception as e: app.logger.error("Err: %s",e)
+        except Exception as e:
+            import traceback; app.logger.error("Err: %s\n%s",e,traceback.format_exc())
+            try: reply_msg(tok,{"type":"text","text":"❌ error: {}".format(str(e)[:100])})
+            except: pass
     return "OK"
 
 # ══════════════════════════════════════════════════════════════
