@@ -34,13 +34,7 @@ def reply_msg(tok, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
     r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-    if r.status_code!=200:
-        app.logger.error("Reply err: %s %s", r.status_code, r.text)
-        # retry without quickReply in case it causes issues
-        for m in msgs:
-            if "quickReply" in m: del m["quickReply"]
-        r2 = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-        if r2.status_code!=200: app.logger.error("Retry err: %s %s", r2.status_code, r2.text)
+    if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
 def push_msg(to, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
