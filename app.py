@@ -104,7 +104,8 @@ def set_pending(uid, cid, act, data=""):
 def get_pending(uid, cid):
     with get_db() as conn:
         cur = conn.cursor()
-        r = cur.execute("SELECT action,data FROM pending_actions WHERE user_chat_key=%s",("{}:{}".format(uid,cid),)).fetchone()
+        cur.execute("SELECT action,data FROM pending_actions WHERE user_chat_key=%s",("{}:{}".format(uid,cid),))
+        r = cur.fetchone()
     return {"action":r["action"],"data":r["data"]} if r else None
 def clear_pending(uid, cid):
     with get_db() as conn: cur = conn.cursor(); cur.execute("DELETE FROM pending_actions WHERE user_chat_key=%s",("{}:{}".format(uid,cid),))
@@ -185,7 +186,8 @@ def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
             sql+=" AND due_date=%s"
             params.append(due_date)
         sql+=" ORDER BY created_at"
-        return [r for r in cur.execute(sql, params).fetchall()]
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 def set_due_date(tid, due):
     with get_db() as conn:
@@ -210,25 +212,29 @@ def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
 def get_task(tid):
     with get_db() as conn:
         cur = conn.cursor()
-        r = cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,)).fetchone()
+        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
+        r = cur.fetchone()
     return r
 
 def get_pending_tasks(cid):
     with get_db() as conn:
         cur = conn.cursor()
-        return [r for r in cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' ORDER BY created_at",(cid,)).fetchall()]
+        cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' ORDER BY created_at",(cid,))
+        return cur.fetchall()
 
 def get_completed_today(cid):
     with get_db() as conn:
         cur = conn.cursor()
-        return [r for r in cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='done' AND completed_at::date=%s ORDER BY completed_at",
-            (cid,datetime.now().strftime("%Y-%m-%d"))).fetchall()]
+        cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='done' AND completed_at::date=%s ORDER BY completed_at",
+            (cid,datetime.now().strftime("%Y-%m-%d")))
+        return cur.fetchall()
 
 def complete_task(tid, by_name="", by_uid=""):
     result = None
     with get_db() as conn:
         cur = conn.cursor()
-        r = cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,)).fetchone()
+        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
+        r = cur.fetchone()
         if r and r["status"]=="pending":
             cur.execute("UPDATE tasks SET status='done',completed_at=%s WHERE id=%s",(datetime.now().isoformat(),tid))
             result = r
@@ -240,7 +246,8 @@ def edit_task(tid, new_title, by_name="", by_uid=""):
     result = None
     with get_db() as conn:
         cur = conn.cursor()
-        r = cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,)).fetchone()
+        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
+        r = cur.fetchone()
         if r:
             cur.execute("UPDATE tasks SET title=%s WHERE id=%s",(new_title.strip(),tid))
             result = {"id":tid,"old":r["title"],"new":new_title.strip(),"chat_id":r["chat_id"]}
@@ -252,7 +259,8 @@ def delete_task(tid, by_name="", by_uid=""):
     result = None
     with get_db() as conn:
         cur = conn.cursor()
-        r = cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,)).fetchone()
+        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
+        r = cur.fetchone()
         if r:
             result = r
             cur.execute("DELETE FROM comments WHERE task_id=%s",(tid,))
@@ -264,7 +272,8 @@ def delete_task(tid, by_name="", by_uid=""):
 def get_active_chats():
     with get_db() as conn:
         cur = conn.cursor()
-        return [r["chat_id"] for r in cur.execute("SELECT DISTINCT chat_id FROM tasks WHERE status='pending'").fetchall()]
+        cur.execute("SELECT DISTINCT chat_id FROM tasks WHERE status='pending'")
+        return [r["chat_id"] for r in cur.fetchall()]
 
 def register_member(cid, uid, name=""):
     with get_db() as conn: cur = conn.cursor(); cur.execute("INSERT INTO chat_members VALUES(%s,%s,%s) ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name=EXCLUDED.display_name",(cid,uid,name))
@@ -284,7 +293,8 @@ def add_comment(tid, cid, author, author_uid, content):
 def get_comments(tid):
     with get_db() as conn:
         cur = conn.cursor()
-        return [r for r in cur.execute("SELECT * FROM comments WHERE task_id=%s ORDER BY created_at",(tid,)).fetchall()]
+        cur.execute("SELECT * FROM comments WHERE task_id=%s ORDER BY created_at",(tid,))
+        return cur.fetchall()
 
 # ── Quick Reply ──────────────────────────────────────────────
 def qr():
@@ -750,7 +760,8 @@ def process_text(text, cid, uid="", name=""):
         auid=""
         with get_db() as conn:
             cur = conn.cursor()
-            mr=cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+aname+"%")).fetchone()
+            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+aname+"%"))
+            mr=cur.fetchone()
             if mr: aname=mr["display_name"]; auid=mr["user_id"]
         added=_parse_and_add_tasks(atitle, cid, name, uid, assigned_to=aname, assigned_to_uid=auid)
         if len(added)==1:
@@ -764,7 +775,8 @@ def process_text(text, cid, uid="", name=""):
         rn=n; ru=""
         with get_db() as conn:
             cur = conn.cursor()
-            mr=cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+n+"%")).fetchone()
+            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+n+"%"))
+            mr=cur.fetchone()
             if mr: rn=mr["display_name"]; ru=mr["user_id"]
         return rn, ru
 
@@ -1123,7 +1135,8 @@ def api_batch():
 def api_members(cid):
     with get_db() as conn:
         cur = conn.cursor()
-        rows = cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s",(cid,)).fetchall()
+        cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s",(cid,))
+        rows = cur.fetchall()
     return jsonify([{"uid":r["user_id"],"name":r["display_name"]} for r in rows])
 
 # ══════════════════════════════════════════════════════════════
