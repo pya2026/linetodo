@@ -92,9 +92,10 @@ def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
 def get_activity_log(task_id, limit=20):
     with get_db() as conn:
         cur = conn.cursor()
-        return [r for r in cur.execute(
+        cur.execute(
             "SELECT * FROM activity_log WHERE task_id=%s ORDER BY created_at DESC LIMIT %s",
-            (task_id, limit)).fetchall()]
+            (task_id, limit))
+        return cur.fetchall()
 
 # ── Pending Actions ──────────────────────────────────────────
 def set_pending(uid, cid, act, data=""):
@@ -203,7 +204,7 @@ def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_uid) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",(cid,title.strip(),by,by_uid,assigned_to,assigned_to_uid))
-    tid = cur.fetchone()["id"]
+        tid = cur.fetchone()["id"]
     detail = "สร้างงาน: {}".format(title.strip())
     if assigned_to and assigned_to != by: detail += " → มอบหมายให้ {}".format(assigned_to)
     log_activity(tid, cid, by, by_uid, "created", detail)
