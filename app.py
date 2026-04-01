@@ -81,6 +81,10 @@ def init_db():
             chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
             action TEXT NOT NULL, detail TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT NOW())""")
+        # Backfill: งานเก่าที่ assigned_to ว่าง → ใส่จาก added_by (ผู้สร้าง=ผู้รับผิดชอบ)
+        c.execute("""UPDATE tasks SET assigned_to = added_by, assigned_to_uid = added_by_user_id
+                     WHERE (assigned_to IS NULL OR assigned_to = '')
+                       AND added_by IS NOT NULL AND added_by != ''""")
 
 # ── Activity Log ─────────────────────────────────────────────
 def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
@@ -171,12 +175,14 @@ def parse_date_only(text):
     return None
 
 def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
-    """Query pending tasks — ดูจาก assigned_to เท่านั้น (ผู้รับผิดชอบ)"""
+    """Query pending tasks — ดูจาก assigned_to (ผู้รับผิดชอบ) + fallback งานเก่าที่ไม่มี assigned"""
     with get_db() as conn:
         cur = conn.cursor()
         if uid:
-            sql="SELECT * FROM tasks WHERE chat_id=%s AND status='pending' AND assigned_to_uid=%s"
-            params=[cid, uid]
+            # งานที่ assigned ให้คนนี้ + งานเก่าที่ assigned ว่างแต่คนนี้สร้าง
+            sql=("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' "
+                 "AND (assigned_to_uid=%s OR (COALESCE(assigned_to_uid,'')='' AND added_by_user_id=%s))")
+            params=[cid, uid, uid]
         elif name:
             sql="SELECT * FROM tasks WHERE chat_id=%s AND status='pending' AND assigned_to LIKE %s"
             params=[cid, "%"+name+"%"]
@@ -334,12 +340,11 @@ def build_mini_card(task, idx):
             {"type":"button","action":{"type":"postback","label":"✅ เสร็จ","data":"action=done&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]
     # แสดง comment ล่าสุดถ้ามี
     comments=get_comments(tid)
-    assigned=task.get("assigned_to","")
+    assigned=task.get("assigned_to","") or task.get("added_by","") or "-"
     due=task.get("due_date","")
     body_contents=[
-        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"}]
-    if assigned:
-        body_contents.append({"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assigned),"size":"xs","color":"#FF6B35","weight":"bold"})
+        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
+        {"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assigned),"size":"xs","color":"#FF6B35","weight":"bold"}]
     if due:
         try:
             dd=datetime.strptime(due,"%Y-%m-%d").strftime("%d/%m/%y")
@@ -378,11 +383,10 @@ def build_full_card(task):
         {"type":"box","layout":"horizontal","contents":[
             {"type":"text","text":"เมื่อ:","size":"xs","color":"#888888","flex":2},
             {"type":"text","text":ca or "-","size":"xs","color":"#333333","flex":5}],"margin":"sm"}]
-    assigned=task.get("assigned_to","")
-    if assigned:
-        body.append({"type":"box","layout":"horizontal","contents":[
-            {"type":"text","text":"👤 มอบหมาย:","size":"xs","color":"#888888","flex":2},
-            {"type":"text","text":assigned,"size":"xs","color":"#FF6B35","flex":5,"weight":"bold"}],"margin":"sm"})
+    assigned=task.get("assigned_to","") or task.get("added_by","") or "-"
+    body.append({"type":"box","layout":"horizontal","contents":[
+        {"type":"text","text":"👤 ผู้รับผิดชอบ:","size":"xs","color":"#888888","flex":2},
+        {"type":"text","text":assigned,"size":"xs","color":"#FF6B35","flex":5,"weight":"bold"}],"margin":"sm"})
     comments=get_comments(tid)
     body.append({"type":"separator","margin":"lg"})
     body.append({"type":"text","text":"💬 ความคิดเห็น ({})".format(len(comments)),"size":"sm","weight":"bold","color":"#1DB446","margin":"lg"})
