@@ -683,9 +683,9 @@ def _build_clockin_inner(cid, uid="", name=""):
     all_today=today_tasks+no_due
     body.append({"type":"text","text":"📋 งานวันนี้ ({})".format(len(all_today)),"weight":"bold","size":"sm","color":"#1DB446","margin":"md"})
     if not all_today:
-        body.append({"type":"text","text":"  — ไม่มีงานวันนี้ 🎉","size":"xs","color":"#999"})
+        body.append({"type":"text","text":"  — ไม่มีงานวันนี้ 🎉","size":"xs","color":"#999999"})
     for t in all_today:
-        body.append({"type":"text","text":"  ⬜ {}".format(t["title"]),"size":"xs","color":"#333","wrap":True})
+        body.append({"type":"text","text":"  ⬜ {}".format(t["title"]),"size":"xs","color":"#333333","wrap":True})
     # งานกำหนดล่วงหน้า
     if future:
         body.append({"type":"separator","margin":"lg"})
@@ -695,7 +695,7 @@ def _build_clockin_inner(cid, uid="", name=""):
             dd=d.strftime("%d/%m") if d else "-"
             body.append({"type":"text","text":"  📆 {} — {}".format(dd,t["title"]),"size":"xs","color":"#1976D2","wrap":True})
         if len(future)>5:
-            body.append({"type":"text","text":"  ...อีก {} งาน".format(len(future)-5),"size":"xs","color":"#999"})
+            body.append({"type":"text","text":"  ...อีก {} งาน".format(len(future)-5),"size":"xs","color":"#999999"})
     # สรุปจำนวน
     total=len(my)
     body.append({"type":"separator","margin":"lg"})
@@ -737,7 +737,7 @@ def _build_clockout_inner(cid, uid="", name=""):
         for t in my_done:
             body.append({"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True})
     else:
-        body.append({"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999"})
+        body.append({"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"})
     # งานค้าง
     body.append({"type":"separator","margin":"lg"})
     body.append({"type":"text","text":"⏳ งานค้าง ({})".format(len(my_pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"md"})
@@ -777,7 +777,7 @@ def build_routine_list(cid):
         body.append({"type":"text","text":"🔁 งานประจำวัน (Daily)","weight":"bold","size":"sm","color":"#4ADE80","margin":"md"})
         for r in daily:
             status="✅" if r.get("active") else "⏸️"
-            body.append({"type":"text","text":"  {}. {} {} — 👤{}".format(idx, status, r["title"], r.get("assigned_to","") or "?"),"size":"xs","color":"#333","wrap":True})
+            body.append({"type":"text","text":"  {}. {} {} — 👤{}".format(idx, status, r["title"], r.get("assigned_to","") or "?"),"size":"xs","color":"#333333","wrap":True})
             idx+=1
     if monthly:
         if daily: body.append({"type":"separator","margin":"md"})
@@ -785,10 +785,10 @@ def build_routine_list(cid):
         for r in monthly:
             status="✅" if r.get("active") else "⏸️"
             dom=r.get("day_of_month","?")
-            body.append({"type":"text","text":"  {}. {} {} — วันที่ {} 👤{}".format(idx, status, r["title"], dom, r.get("assigned_to","") or "?"),"size":"xs","color":"#333","wrap":True})
+            body.append({"type":"text","text":"  {}. {} {} — วันที่ {} 👤{}".format(idx, status, r["title"], dom, r.get("assigned_to","") or "?"),"size":"xs","color":"#333333","wrap":True})
             idx+=1
     body.append({"type":"separator","margin":"lg"})
-    body.append({"type":"text","text":"พิมพ์ ลบงานประจำ # เพื่อลบ","size":"xxs","color":"#999","align":"center","margin":"sm"})
+    body.append({"type":"text","text":"พิมพ์ ลบงานประจำ # เพื่อลบ","size":"xxs","color":"#999999","align":"center","margin":"sm"})
     ru=routine_page_url(cid)
     footer_c=[]
     if ru:
