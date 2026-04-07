@@ -597,7 +597,8 @@ def build_clockout(cid, uid="", name=""):
     now=datetime.now()
     # งานที่เสร็จวันนี้ของผู้ส่ง
     all_done=get_completed_today(cid)
-    my_done=[t for t in all_done if t.get("assigned_to_uid")==uid] if uid else all_done
+    # filter เฉพาะงานของผู้ส่ง: assigned_to_uid ตรง หรือ assigned ว่างแต่เป็นคนสร้าง
+    my_done=[t for t in all_done if t.get("assigned_to_uid")==uid or (not t.get("assigned_to_uid") and t.get("added_by_user_id")==uid)] if uid else all_done
     # งานค้างของผู้ส่ง
     my_pend=query_tasks_by_person(cid, uid=uid)
     body=[]
