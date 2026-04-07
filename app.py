@@ -81,10 +81,19 @@ def init_db():
             chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
             action TEXT NOT NULL, detail TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT NOW())""")
-        # Backfill: งานเก่าที่ assigned_to ว่าง → ใส่จาก added_by (ผู้สร้าง=ผู้รับผิดชอบ)
+        # Backfill 1: งานเก่าที่ assigned_to ว่าง + มีชื่อ added_by → ใส่จาก added_by
         c.execute("""UPDATE tasks SET assigned_to = added_by, assigned_to_uid = added_by_user_id
                      WHERE (assigned_to IS NULL OR assigned_to = '')
                        AND added_by IS NOT NULL AND added_by != ''""")
+        # Backfill 2: งานที่ assigned_to ว่าง + added_by ว่าง แต่มี added_by_user_id → ดึงชื่อจาก chat_members
+        c.execute("""UPDATE tasks t SET
+                       assigned_to = m.display_name,
+                       assigned_to_uid = t.added_by_user_id,
+                       added_by = m.display_name
+                     FROM chat_members m
+                     WHERE m.chat_id = t.chat_id AND m.user_id = t.added_by_user_id
+                       AND (t.assigned_to IS NULL OR t.assigned_to = '')
+                       AND t.added_by_user_id IS NOT NULL AND t.added_by_user_id != ''""")
 
 # ── Activity Log ─────────────────────────────────────────────
 def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
@@ -345,11 +354,9 @@ def build_mini_card(task, idx):
     body_contents=[
         {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
         {"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assigned),"size":"xs","color":"#FF6B35","weight":"bold"}]
-    if due:
-        try:
-            dd=datetime.strptime(due,"%Y-%m-%d").strftime("%d/%m/%y")
-            body_contents.append({"type":"text","text":"📅 กำหนด: {}".format(dd),"size":"xs","color":"#0066CC"})
-        except: pass
+    d=_to_date(due)
+    if d:
+        body_contents.append({"type":"text","text":"📅 กำหนด: {}".format(d.strftime("%d/%m/%y")),"size":"xs","color":"#0066CC"})
     body_contents.append({"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"})
     if comments:
         c=comments[-1]; ts=""
@@ -476,9 +483,8 @@ def build_all_persons_flex(cid):
         for i,t in enumerate(tasks,1):
             due=t.get("due_date","")
             dd=""
-            if due:
-                try: dd=" [📅{}]".format(datetime.strptime(due,"%Y-%m-%d").strftime("%d/%m"))
-                except: pass
+            dv=_to_date(due)
+            if dv: dd=" [📅{}]".format(dv.strftime("%d/%m"))
             task_lines.append({"type":"text","text":"{}. {}{}".format(i,t["title"],dd),"size":"sm","color":"#333333","wrap":True,"margin":"sm"})
         bubble={"type":"bubble","size":"kilo",
             "header":{"type":"box","layout":"vertical","contents":[
@@ -528,33 +534,39 @@ def get_tasks_by_person(cid):
         by_person.setdefault(person,[]).append(t)
     return pend, by_person
 
+def _to_date(v):
+    """Convert due_date value to datetime.date for comparison (handles both date obj and string)"""
+    if not v: return None
+    if hasattr(v, 'year'): return v  # already datetime.date
+    try: return datetime.strptime(str(v), "%Y-%m-%d").date()
+    except: return None
+
 def get_today_tasks(cid):
     """งานที่ due วันนี้ + งานค้างที่ไม่มี due"""
-    today=datetime.now().strftime("%Y-%m-%d")
+    today=datetime.now().date()
     pend=get_pending_tasks(cid)
-    today_tasks=[t for t in pend if t.get("due_date")==today]
+    today_tasks=[t for t in pend if _to_date(t.get("due_date"))==today]
     no_due=[t for t in pend if not t.get("due_date")]
-    overdue=[t for t in pend if t.get("due_date") and t["due_date"]<today]
-    future=[t for t in pend if t.get("due_date") and t["due_date"]>today]
+    overdue=[t for t in pend if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))<today]
+    future=[t for t in pend if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))>today]
     return today_tasks, no_due, overdue, future
 
 def build_clockin(cid, uid="", name=""):
     """เข้างาน — แสดงเฉพาะงานของผู้ส่ง (overdue + วันนี้ + ไม่มีกำหนด + กำหนดล่วงหน้า)"""
     now=datetime.now()
-    today=now.strftime("%Y-%m-%d")
+    today=now.date()
     my=query_tasks_by_person(cid, uid=uid)
-    overdue=[t for t in my if t.get("due_date") and t["due_date"]<today]
-    today_tasks=[t for t in my if t.get("due_date")==today]
+    overdue=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))<today]
+    today_tasks=[t for t in my if _to_date(t.get("due_date"))==today]
     no_due=[t for t in my if not t.get("due_date")]
-    future=[t for t in my if t.get("due_date") and t["due_date"]>today]
+    future=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))>today]
     body=[]
     # งาน overdue
     if overdue:
         body.append({"type":"text","text":"🔴 งานเลยกำหนด ({})".format(len(overdue)),"weight":"bold","size":"sm","color":"#E53935","margin":"md"})
         for t in overdue:
-            dd=t.get("due_date","")
-            try: dd=datetime.strptime(dd,"%Y-%m-%d").strftime("%d/%m")
-            except: pass
+            d=_to_date(t.get("due_date"))
+            dd=d.strftime("%d/%m") if d else "-"
             body.append({"type":"text","text":"  ⚠️ {} (📅{})".format(t["title"],dd),"size":"xs","color":"#E53935","wrap":True})
         body.append({"type":"separator","margin":"md"})
     # งานวันนี้ + ไม่มีกำหนด
@@ -569,9 +581,8 @@ def build_clockin(cid, uid="", name=""):
         body.append({"type":"separator","margin":"lg"})
         body.append({"type":"text","text":"📅 กำหนดไว้ ({})".format(len(future)),"weight":"bold","size":"sm","color":"#1976D2","margin":"md"})
         for t in future[:5]:
-            dd=t.get("due_date","")
-            try: dd=datetime.strptime(dd,"%Y-%m-%d").strftime("%d/%m")
-            except: pass
+            d=_to_date(t.get("due_date"))
+            dd=d.strftime("%d/%m") if d else "-"
             body.append({"type":"text","text":"  📆 {} — {}".format(dd,t["title"]),"size":"xs","color":"#1976D2","wrap":True})
         if len(future)>5:
             body.append({"type":"text","text":"  ...อีก {} งาน".format(len(future)-5),"size":"xs","color":"#999"})
@@ -613,14 +624,12 @@ def build_clockout(cid, uid="", name=""):
     body.append({"type":"separator","margin":"lg"})
     body.append({"type":"text","text":"⏳ งานค้าง ({})".format(len(my_pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"md"})
     if my_pend:
-        today=now.strftime("%Y-%m-%d")
+        today_d=now.date()
         for i,t in enumerate(my_pend,1):
-            dd=t.get("due_date","")
+            d=_to_date(t.get("due_date"))
             tag=""
-            if dd and dd<today: tag=" 🔴เลยกำหนด"
-            elif dd:
-                try: tag=" [📅{}]".format(datetime.strptime(dd,"%Y-%m-%d").strftime("%d/%m"))
-                except: pass
+            if d and d<today_d: tag=" 🔴เลยกำหนด"
+            elif d: tag=" [📅{}]".format(d.strftime("%d/%m"))
             body.append({"type":"text","text":"  {}. {}{}".format(i,t["title"],tag),"size":"xs","color":"#FF6B35","wrap":True})
     else:
         body.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
