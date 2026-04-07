@@ -412,6 +412,7 @@ def qr():
         {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
         {"type":"action","action":{"type":"message","label":"📋 ดูงาน","text":"ดูงาน"}},
+        {"type":"action","action":{"type":"message","label":"📌 งานค้าง","text":"งานค้าง"}},
         {"type":"action","action":{"type":"message","label":"👥 งานทุกคน","text":"งานทุกคน"}},
         {"type":"action","action":{"type":"message","label":"🔄 งานประจำ","text":"ดูงานประจำ"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
@@ -1081,8 +1082,15 @@ def process_text(text, cid, uid="", name=""):
         my=query_tasks_by_person(cid, uid=uid, due_date=due)
         return _show_tasks(my, "ฉัน", date_part if due else None)
 
-    # Pattern: งานค้าง / รายการ — all tasks (no filter)
-    if tl in ["งานค้าง","รายการ"]: return build_list_flex(cid)
+    # Pattern: งานค้าง — งานค้างของตัวเอง (filtered by uid) as carousel mini cards + LIFF
+    if tl in ["งานค้าง","รายการ","my tasks"]:
+        my=query_tasks_by_person(cid, uid=uid)
+        if not my: return aqr("🎉 ไม่มีงานค้างของคุณ!")
+        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
+        alt="📋 งานค้างของคุณ {} งาน".format(len(my))
+        if len(cards)==1:
+            return aqr({"type":"flex","altText":alt,"contents":cards[0]})
+        return aqr({"type":"flex","altText":alt,"contents":{"type":"carousel","contents":cards[:10]}})
 
     # Pattern: งานทุกคน — แยก 1 คน = 1 bubble
     if tl in ["งานทุกคน","all tasks","alltasks"]: return build_all_persons_flex(cid)
