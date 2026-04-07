@@ -94,6 +94,20 @@ def init_db():
                      WHERE m.chat_id = t.chat_id AND m.user_id = t.added_by_user_id
                        AND (t.assigned_to IS NULL OR t.assigned_to = '')
                        AND t.added_by_user_id IS NOT NULL AND t.added_by_user_id != ''""")
+        # ── Routines table ──
+        c.execute("""CREATE TABLE IF NOT EXISTS routines (
+            id SERIAL PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            routine_type TEXT DEFAULT 'daily',
+            day_of_month INTEGER,
+            assigned_to TEXT DEFAULT '',
+            assigned_to_uid TEXT DEFAULT '',
+            created_by TEXT DEFAULT '',
+            created_by_uid TEXT DEFAULT '',
+            active BOOLEAN DEFAULT TRUE,
+            last_generated DATE,
+            created_at TIMESTAMP DEFAULT NOW())""")
 
 # ── Activity Log ─────────────────────────────────────────────
 def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
@@ -299,6 +313,78 @@ def get_task_index(cid, tid):
         if t["id"]==tid: return i
     return 0
 
+# ── Routine CRUD ────────────────────────────────────────────
+def add_routine(cid, title, routine_type="daily", day_of_month=None, assigned_to="", assigned_to_uid="", created_by="", created_by_uid=""):
+    if not assigned_to:
+        assigned_to = created_by
+        assigned_to_uid = created_by_uid
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO routines(chat_id,title,routine_type,day_of_month,assigned_to,assigned_to_uid,created_by,created_by_uid) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (cid, title.strip(), routine_type, day_of_month, assigned_to, assigned_to_uid, created_by, created_by_uid))
+        return cur.fetchone()["id"]
+
+def get_routines(cid, active_only=True):
+    with get_db() as conn:
+        cur = conn.cursor()
+        if active_only:
+            cur.execute("SELECT * FROM routines WHERE chat_id=%s AND active=TRUE ORDER BY routine_type, day_of_month NULLS FIRST, id", (cid,))
+        else:
+            cur.execute("SELECT * FROM routines WHERE chat_id=%s ORDER BY routine_type, day_of_month NULLS FIRST, id", (cid,))
+        return cur.fetchall()
+
+def get_routine(rid):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM routines WHERE id=%s", (rid,))
+        return cur.fetchone()
+
+def delete_routine(rid):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM routines WHERE id=%s", (rid,))
+        r = cur.fetchone()
+        if r:
+            cur.execute("DELETE FROM routines WHERE id=%s", (rid,))
+        return r
+
+def toggle_routine(rid, active=True):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE routines SET active=%s WHERE id=%s", (active, rid))
+
+def generate_routine_tasks(cid, uid, name):
+    """เข้างาน → สร้างงานจาก routine ที่ตรงวัน (daily + monthly ตรงวันที่)
+    Returns list of created task titles. ป้องกันซ้ำด้วย last_generated."""
+    today = datetime.now().date()
+    day = today.day
+    routines = get_routines(cid, active_only=True)
+    created = []
+    for r in routines:
+        # เช็คว่า routine นี้เป็นของ user นี้ไหม
+        if r["assigned_to_uid"] and r["assigned_to_uid"] != uid:
+            continue
+        if not r["assigned_to_uid"] and r["assigned_to"] and r["assigned_to"] != name:
+            continue
+        # เช็คประเภท
+        if r["routine_type"] == "monthly" and r.get("day_of_month") != day:
+            continue
+        # เช็คว่าสร้างไปแล้ววันนี้หรือยัง
+        lg = _to_date(r.get("last_generated"))
+        if lg and lg >= today:
+            continue
+        # สร้างงาน
+        t = add_task(cid, r["title"], by=name, by_uid=uid,
+                     assigned_to=r.get("assigned_to","") or name,
+                     assigned_to_uid=r.get("assigned_to_uid","") or uid)
+        set_due_date(t["id"], today.strftime("%Y-%m-%d"))
+        created.append(r["title"])
+        # อัพเดท last_generated
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE routines SET last_generated=%s WHERE id=%s", (today, r["id"]))
+    return created
+
 # ── Comments ─────────────────────────────────────────────────
 def add_comment(tid, cid, author, author_uid, content):
     with get_db() as conn:
@@ -320,6 +406,7 @@ def qr():
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
         {"type":"action","action":{"type":"message","label":"📋 ดูงาน","text":"ดูงาน"}},
         {"type":"action","action":{"type":"message","label":"👥 งานทุกคน","text":"งานทุกคน"}},
+        {"type":"action","action":{"type":"message","label":"🔄 งานประจำ","text":"ดูงานประจำ"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -552,15 +639,23 @@ def get_today_tasks(cid):
     return today_tasks, no_due, overdue, future
 
 def build_clockin(cid, uid="", name=""):
-    """เข้างาน — แสดงเฉพาะงานของผู้ส่ง (overdue + วันนี้ + ไม่มีกำหนด + กำหนดล่วงหน้า)"""
+    """เข้างาน — สร้างงาน routine อัตโนมัติ + แสดงเฉพาะงานของผู้ส่ง"""
     now=datetime.now()
     today=now.date()
+    # Auto-create routine tasks
+    routine_created = generate_routine_tasks(cid, uid, name) if uid else []
     my=query_tasks_by_person(cid, uid=uid)
     overdue=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))<today]
     today_tasks=[t for t in my if _to_date(t.get("due_date"))==today]
     no_due=[t for t in my if not t.get("due_date")]
     future=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))>today]
     body=[]
+    # แสดง routine ที่สร้างอัตโนมัติ
+    if routine_created:
+        body.append({"type":"text","text":"🔄 Routine สร้างอัตโนมัติ ({})".format(len(routine_created)),"weight":"bold","size":"sm","color":"#6366F1","margin":"md"})
+        for rt in routine_created:
+            body.append({"type":"text","text":"  ✨ {}".format(rt),"size":"xs","color":"#6366F1","wrap":True})
+        body.append({"type":"separator","margin":"md"})
     # งาน overdue
     if overdue:
         body.append({"type":"text","text":"🔴 งานเลยกำหนด ({})".format(len(overdue)),"weight":"bold","size":"sm","color":"#E53935","margin":"md"})
@@ -646,6 +741,46 @@ def build_clockout(cid, uid="", name=""):
             {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
         ],"paddingAll":"15px","backgroundColor":"#FFF3E0"},
         "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"}}})
+
+def build_routine_list(cid):
+    """แสดงรายการงานประจำทั้งหมดในกลุ่ม"""
+    rlist=get_routines(cid, active_only=False)
+    if not rlist: return aqr("📭 ยังไม่มีงานประจำ\n\nใช้คำสั่ง:\n  ตั้งงานประจำวัน งาน1,งาน2\n  ตั้งงานประจำเดือน 25 งาน1,งาน2")
+    daily=[r for r in rlist if r["routine_type"]=="daily"]
+    monthly=[r for r in rlist if r["routine_type"]=="monthly"]
+    body=[]
+    idx=1
+    if daily:
+        body.append({"type":"text","text":"🔁 งานประจำวัน (Daily)","weight":"bold","size":"sm","color":"#4ADE80","margin":"md"})
+        for r in daily:
+            status="✅" if r.get("active") else "⏸️"
+            body.append({"type":"text","text":"  {}. {} {} — 👤{}".format(idx, status, r["title"], r.get("assigned_to","") or "?"),"size":"xs","color":"#333","wrap":True})
+            idx+=1
+    if monthly:
+        if daily: body.append({"type":"separator","margin":"md"})
+        body.append({"type":"text","text":"📅 งานประจำเดือน (Monthly)","weight":"bold","size":"sm","color":"#F59E0B","margin":"md"})
+        for r in monthly:
+            status="✅" if r.get("active") else "⏸️"
+            dom=r.get("day_of_month","?")
+            body.append({"type":"text","text":"  {}. {} {} — วันที่ {} 👤{}".format(idx, status, r["title"], dom, r.get("assigned_to","") or "?"),"size":"xs","color":"#333","wrap":True})
+            idx+=1
+    body.append({"type":"separator","margin":"lg"})
+    body.append({"type":"text","text":"พิมพ์ ลบงานประจำ # เพื่อลบ","size":"xxs","color":"#999","align":"center","margin":"sm"})
+    ru=routine_page_url(cid)
+    footer_c=[]
+    if ru:
+        footer_c.append({"type":"button","action":{"type":"uri","label":"🔄 จัดการงานประจำ","uri":ru},"style":"primary","color":"#6366F1","height":"sm"})
+    return aqr({"type":"flex","altText":"🔄 งานประจำ {} รายการ".format(len(rlist)),"contents":{"type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","contents":[
+            {"type":"text","text":"🔄 งานประจำในกลุ่ม","weight":"bold","size":"lg","color":"#FFFFFF"},
+            {"type":"text","text":"{} รายการ".format(len(rlist)),"size":"xs","color":"#FFFFFFCC"}
+        ],"paddingAll":"15px","backgroundColor":"#6366F1"},
+        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
+        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"10px"} if footer_c else None}})
+
+def routine_page_url(cid):
+    if APP_URL: return APP_URL.rstrip("/")+"/liff/routines?chat_id={}".format(cid)
+    return None
 
 def build_help():
     return aqr({"type":"flex","altText":"📖 วิธีใช้","contents":{"type":"bubble",
@@ -735,7 +870,7 @@ def _parse_and_add_tasks(raw, cid, name, uid, assigned_to="", assigned_to_uid=""
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","งานทุกคน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","งานทุกคน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu","ตั้งงานประจำวัน","ตั้งงานประจำเดือน","ดูงานประจำ","ลบงานประจำ","งานประจำ"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -755,7 +890,79 @@ def process_text(text, cid, uid="", name=""):
                 return aqr("❌ ไม่พบงานนี้")
 
     if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid, uid, name)
-    if tl in ["เลิกงาน","clock out","สรุป","summary"]: return build_clockout(cid, uid, name)
+    if tl in ["เลิกงาน","clock out"]: return build_clockout(cid, uid, name)
+
+    # ── Routine Commands ──
+    # ตั้งงานประจำวัน งาน1,งาน2
+    mr=re.match(r"^ตั้งงานประจำวัน\s+(.+)",ts,re.I)
+    if mr:
+        items=[x.strip() for x in re.split(r'[,，]+', mr.group(1)) if x.strip()]
+        ids=[]
+        for title in items:
+            rid=add_routine(cid, title, routine_type="daily", assigned_to=name, assigned_to_uid=uid, created_by=name, created_by_uid=uid)
+            ids.append(title)
+        if ids:
+            return aqr("✅ ตั้งงานประจำ*วัน*แล้ว {} รายการ\n\n🔁 Daily Routine:\n{}\n\n👤 ผู้รับผิดชอบ: {}\n\n_จะถูกเพิ่มอัตโนมัติทุกวันตอน \"เข้างาน\"_".format(
+                len(ids), "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(ids,1)]), name or "คุณ"))
+        return aqr("❌ ไม่พบชื่องาน")
+
+    # @ชื่อ ตั้งงานประจำวัน งาน1,งาน2
+    mr=re.match(r"^@(\S+)\s+ตั้งงานประจำวัน\s+(.+)",ts,re.I)
+    if mr:
+        aname=mr.group(1).strip(); auid=""
+        with get_db() as conn:
+            cur=conn.cursor()
+            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s",(cid,"%"+aname+"%"))
+            m2=cur.fetchone()
+            if m2: aname=m2["display_name"]; auid=m2["user_id"]
+        items=[x.strip() for x in re.split(r'[,，]+', mr.group(2)) if x.strip()]
+        for title in items:
+            add_routine(cid, title, routine_type="daily", assigned_to=aname, assigned_to_uid=auid, created_by=name, created_by_uid=uid)
+        return aqr("✅ ตั้งงานประจำ*วัน*ให้ {} แล้ว {} รายการ\n\n🔁 Daily Routine:\n{}".format(
+            aname, len(items), "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)])))
+
+    # ตั้งงานประจำเดือน 25 งาน1,งาน2
+    mr=re.match(r"^ตั้งงานประจำเดือน\s+(\d{1,2})\s+(.+)",ts,re.I)
+    if mr:
+        dom=int(mr.group(1))
+        if dom<1 or dom>31: return aqr("❌ วันที่ต้องอยู่ระหว่าง 1-31")
+        items=[x.strip() for x in re.split(r'[,，]+', mr.group(2)) if x.strip()]
+        for title in items:
+            add_routine(cid, title, routine_type="monthly", day_of_month=dom, assigned_to=name, assigned_to_uid=uid, created_by=name, created_by_uid=uid)
+        return aqr("✅ ตั้งงานประจำ*เดือน*แล้ว {} รายการ\n\n📅 วันที่ {} ของทุกเดือน:\n{}\n\n👤 ผู้รับผิดชอบ: {}".format(
+            len(items), dom, "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)]), name or "คุณ"))
+
+    # @ชื่อ ตั้งงานประจำเดือน 25 งาน1,งาน2
+    mr=re.match(r"^@(\S+)\s+ตั้งงานประจำเดือน\s+(\d{1,2})\s+(.+)",ts,re.I)
+    if mr:
+        aname=mr.group(1).strip(); dom=int(mr.group(2)); auid=""
+        if dom<1 or dom>31: return aqr("❌ วันที่ต้องอยู่ระหว่าง 1-31")
+        with get_db() as conn:
+            cur=conn.cursor()
+            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s",(cid,"%"+aname+"%"))
+            m2=cur.fetchone()
+            if m2: aname=m2["display_name"]; auid=m2["user_id"]
+        items=[x.strip() for x in re.split(r'[,，]+', mr.group(3)) if x.strip()]
+        for title in items:
+            add_routine(cid, title, routine_type="monthly", day_of_month=dom, assigned_to=aname, assigned_to_uid=auid, created_by=name, created_by_uid=uid)
+        return aqr("✅ ตั้งงานประจำ*เดือน*ให้ {} แล้ว {} รายการ\n\n📅 วันที่ {} ของทุกเดือน:\n{}".format(
+            aname, len(items), dom, "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)])))
+
+    # ดูงานประจำ
+    if tl in ["ดูงานประจำ","งานประจำ","routine","routines"]:
+        return build_routine_list(cid)
+
+    # ลบงานประจำ #
+    mr=re.match(r"^ลบงานประจำ\s*(\d+)",ts,re.I)
+    if mr:
+        rlist=get_routines(cid, active_only=False)
+        idx=int(mr.group(1))
+        if 1<=idx<=len(rlist):
+            r=rlist[idx-1]
+            delete_routine(r["id"])
+            return aqr("🗑️ ลบงานประจำแล้ว: {}".format(r["title"]))
+        return aqr("❌ ไม่พบงานประจำ #{}".format(idx))
+
     m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
     if m:
         raw=m.group(1).strip()
@@ -1154,6 +1361,126 @@ def api_members(cid):
         rows = cur.fetchall()
     return jsonify([{"uid":r["user_id"],"name":r["display_name"]} for r in rows])
 
+# ── Routine API ──────────────────────────────────────────────
+@app.route("/api/routines/<path:cid>")
+def api_routines(cid):
+    rlist=get_routines(cid, active_only=False)
+    return jsonify([{"id":r["id"],"title":r["title"],"type":r["routine_type"],
+        "day":r.get("day_of_month"),"assigned_to":r.get("assigned_to",""),
+        "assigned_to_uid":r.get("assigned_to_uid",""),"active":r.get("active",True),
+        "created_by":r.get("created_by","")} for r in rlist])
+
+@app.route("/api/routine",methods=["POST"])
+def api_add_routine():
+    d=request.json or {}
+    cid=d.get("chat_id",""); title=d.get("title",""); rtype=d.get("type","daily")
+    dom=d.get("day") ; ato=d.get("assigned_to",""); auid=d.get("assigned_to_uid","")
+    cby=d.get("created_by",""); cbuid=d.get("created_by_uid","")
+    if not cid or not title: return jsonify({"ok":False,"error":"missing fields"}),400
+    rid=add_routine(cid,title,routine_type=rtype,day_of_month=int(dom) if dom else None,
+        assigned_to=ato,assigned_to_uid=auid,created_by=cby,created_by_uid=cbuid)
+    return jsonify({"ok":True,"id":rid})
+
+@app.route("/api/routine/<int:rid>",methods=["DELETE"])
+def api_delete_routine(rid):
+    r=delete_routine(rid)
+    if r: return jsonify({"ok":True,"title":r["title"]})
+    return jsonify({"ok":False,"error":"not found"}),404
+
+@app.route("/api/routine/<int:rid>/toggle",methods=["POST"])
+def api_toggle_routine(rid):
+    d=request.json or {}
+    toggle_routine(rid, d.get("active",True))
+    return jsonify({"ok":True})
+
+# ── Routine LIFF Page ───────────────────────────────────────
+ROUTINE_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>จัดการงานประจำ</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F172A;color:#E2E8F0;padding:16px}
+h1{font-size:20px;text-align:center;margin-bottom:16px;color:#fff}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tab{flex:1;padding:10px;border-radius:10px;text-align:center;font-weight:700;font-size:14px;cursor:pointer;border:none}
+.tab.active-daily{background:#4ADE80;color:#0F172A}
+.tab.active-monthly{background:#F59E0B;color:#0F172A}
+.tab.inactive{background:#1E293B;color:#94A3B8}
+.card{background:#1E293B;border-radius:12px;padding:14px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
+.card .info{flex:1}
+.card .title{font-weight:700;font-size:15px}
+.card .meta{font-size:12px;color:#94A3B8;margin-top:4px}
+.card .del{background:#EF4444;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;font-weight:600}
+.card .pause{background:#334155;color:#F59E0B;border:none;border-radius:8px;padding:8px 10px;font-size:13px;cursor:pointer}
+.add-form{background:#1E293B;border-radius:12px;padding:16px;margin-bottom:16px}
+.add-form input,.add-form select{width:100%;padding:10px;border-radius:8px;border:1px solid #334155;background:#0F172A;color:#E2E8F0;font-size:14px;margin-bottom:8px}
+.add-form .row{display:flex;gap:8px}
+.add-form .row>*{flex:1}
+.btn-add{width:100%;padding:12px;border:none;border-radius:10px;background:#6366F1;color:#fff;font-weight:700;font-size:15px;cursor:pointer}
+.btn-add:active{background:#4F46E5}
+.empty{text-align:center;color:#64748B;padding:40px 0;font-size:14px}
+.badge-daily{background:#4ADE8033;color:#4ADE80;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
+.badge-monthly{background:#F59E0B33;color:#F59E0B;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
+</style>
+</head><body>
+<h1>🔄 จัดการงานประจำ</h1>
+<div class="add-form">
+  <input id="newTitle" placeholder="ชื่องาน routine ใหม่...">
+  <div class="row">
+    <select id="newType"><option value="daily">🔁 ประจำวัน</option><option value="monthly">📅 ประจำเดือน</option></select>
+    <input id="newDay" type="number" min="1" max="31" placeholder="วันที่" style="display:none">
+    <select id="newPerson"><option value="">👤 ตัวเอง</option></select>
+  </div>
+  <button class="btn-add" onclick="addRoutine()">➕ เพิ่มงานประจำ</button>
+</div>
+<div id="list"></div>
+<script>
+const API=location.origin+'/api';
+const params=new URLSearchParams(location.search);
+const chatId=params.get('chat_id')||'';
+let routines=[];
+document.getElementById('newType').onchange=function(){
+  document.getElementById('newDay').style.display=this.value==='monthly'?'block':'none';
+};
+async function load(){
+  try{
+    const [rRes,mRes]=await Promise.all([fetch(API+'/routines/'+chatId),fetch(API+'/members/'+chatId)]);
+    routines=await rRes.json();
+    const members=await mRes.json();
+    const sel=document.getElementById('newPerson');
+    members.forEach(m=>{const o=document.createElement('option');o.value=JSON.stringify({name:m.name,uid:m.uid});o.textContent='👤 '+m.name;sel.appendChild(o);});
+    render();
+  }catch(e){document.getElementById('list').innerHTML='<div class="empty">❌ โหลดไม่ได้</div>';}
+}
+function render(){
+  const el=document.getElementById('list');
+  if(!routines.length){el.innerHTML='<div class="empty">📭 ยังไม่มีงานประจำ</div>';return;}
+  el.innerHTML=routines.map((r,i)=>{
+    const badge=r.type==='daily'?'<span class="badge-daily">🔁 Daily</span>':'<span class="badge-monthly">📅 วันที่ '+r.day+'</span>';
+    const opacity=r.active?'1':'0.5';
+    return '<div class="card" style="opacity:'+opacity+'"><div class="info"><div class="title">'+badge+' '+r.title+'</div><div class="meta">👤 '+(r.assigned_to||'?')+' • สร้างโดย '+(r.created_by||'?')+'</div></div><button class="pause" onclick="tog('+r.id+','+r.active+')">'+(r.active?'⏸️':'▶️')+'</button><button class="del" onclick="del_('+r.id+')">🗑️</button></div>';
+  }).join('');
+}
+async function addRoutine(){
+  const title=document.getElementById('newTitle').value.trim();
+  const type=document.getElementById('newType').value;
+  const day=document.getElementById('newDay').value;
+  const pv=document.getElementById('newPerson').value;
+  if(!title){alert('กรุณาใส่ชื่องาน');return;}
+  let ato='',auid='';
+  if(pv){try{const p=JSON.parse(pv);ato=p.name;auid=p.uid;}catch(e){}}
+  const body={chat_id:chatId,title,type,assigned_to:ato,assigned_to_uid:auid};
+  if(type==='monthly'){if(!day||day<1||day>31){alert('ระบุวันที่ 1-31');return;}body.day=parseInt(day);}
+  await fetch(API+'/routine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  document.getElementById('newTitle').value='';
+  const rRes=await fetch(API+'/routines/'+chatId);routines=await rRes.json();render();
+}
+async function del_(id){if(!confirm('ลบงานประจำนี้?'))return;await fetch(API+'/routine/'+id,{method:'DELETE'});const r=await fetch(API+'/routines/'+chatId);routines=await r.json();render();}
+async function tog(id,cur){await fetch(API+'/routine/'+id+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!cur})});const r=await fetch(API+'/routines/'+chatId);routines=await r.json();render();}
+load();
+</script>
+</body></html>"""
+
 # ══════════════════════════════════════════════════════════════
 # Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
@@ -1488,6 +1815,13 @@ def task_page():
 def summary_page():
     from flask import make_response
     resp = make_response(SUMMARY_PAGE_HTML)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+@app.route("/liff/routines")
+def routines_page():
+    from flask import make_response
+    resp = make_response(ROUTINE_PAGE_HTML)
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
