@@ -640,6 +640,14 @@ def get_today_tasks(cid):
 
 def build_clockin(cid, uid="", name=""):
     """เข้างาน — สร้างงาน routine อัตโนมัติ + แสดงเฉพาะงานของผู้ส่ง"""
+    try:
+        return _build_clockin_inner(cid, uid, name)
+    except Exception as e:
+        import traceback
+        app.logger.error("clockin err: %s\n%s", e, traceback.format_exc())
+        return aqr("❌ เข้างาน error: {}".format(str(e)[:150]))
+
+def _build_clockin_inner(cid, uid="", name=""):
     now=datetime.now()
     today=now.date()
     # Auto-create routine tasks
@@ -700,6 +708,14 @@ def build_clockin(cid, uid="", name=""):
 
 def build_clockout(cid, uid="", name=""):
     """เลิกงาน — สรุปเฉพาะงานของผู้ส่ง (เสร็จวันนี้ + งานค้าง)"""
+    try:
+        return _build_clockout_inner(cid, uid, name)
+    except Exception as e:
+        import traceback
+        app.logger.error("clockout err: %s\n%s", e, traceback.format_exc())
+        return aqr("❌ เลิกงาน error: {}".format(str(e)[:150]))
+
+def _build_clockout_inner(cid, uid="", name=""):
     now=datetime.now()
     # งานที่เสร็จวันนี้ของผู้ส่ง
     all_done=get_completed_today(cid)
@@ -1835,6 +1851,29 @@ def serve_upload(fname):
 
 @app.route("/", methods=["GET"])
 def health(): return "LINE Todo Bot v6 running!"
+
+@app.route("/debug/tasks/<path:cid>")
+def debug_tasks(cid):
+    """Debug endpoint — ดูข้อมูลงานในกลุ่ม"""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id,title,status,due_date,assigned_to,assigned_to_uid,added_by,added_by_user_id FROM tasks WHERE chat_id=%s ORDER BY id DESC LIMIT 20",(cid,))
+            tasks = cur.fetchall()
+            cur.execute("SELECT * FROM routines WHERE chat_id=%s",(cid,))
+            routines = cur.fetchall()
+            cur.execute("SELECT * FROM chat_members WHERE chat_id=%s",(cid,))
+            members = cur.fetchall()
+        # Convert dates to strings for JSON
+        for t in tasks:
+            for k in ["due_date","created_at","completed_at"]:
+                if t.get(k) and hasattr(t[k],'isoformat'): t[k]=t[k].isoformat()
+        for r in routines:
+            for k in ["last_generated","created_at"]:
+                if r.get(k) and hasattr(r[k],'isoformat'): r[k]=r[k].isoformat()
+        return jsonify({"tasks":[dict(t) for t in tasks],"routines":[dict(r) for r in routines],"members":[dict(m) for m in members]})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
 
 init_db()
 
