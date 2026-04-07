@@ -27,11 +27,18 @@ def lh():
 def verify_sig(body, sig):
     h = hmac.new(LINE_CHANNEL_SECRET.encode(), body.encode(), hashlib.sha256).digest()
     return hmac.compare_digest(base64.b64encode(h).decode(), sig)
-def reply_msg(tok, msgs):
+def reply_msg(tok, msgs, _cid=None):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
     r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-    if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
+    if r.status_code!=200:
+        app.logger.error("Reply err: %s %s", r.status_code, r.text)
+        # Flex message อาจถูก LINE reject → fallback ส่ง push_msg แจ้ง error
+        if _cid:
+            try:
+                err_detail = r.text[:200] if r.text else "unknown"
+                push_msg(_cid, "❌ LINE reject message ({}): {}".format(r.status_code, err_detail))
+            except: pass
 def push_msg(to, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
@@ -1276,12 +1283,12 @@ def callback():
             if name and cid!=uid: register_member(cid,uid,name)
             if ev.get("type")=="message" and ev.get("message",{}).get("type")=="text":
                 r=process_text(ev["message"]["text"].strip(),cid,uid,name)
-                if r: reply_msg(tok,r)
+                if r: reply_msg(tok,r,_cid=cid)
             elif ev.get("type")=="postback":
                 handle_pb(ev.get("postback",{}).get("data",""),cid,tok,uid,name)
         except Exception as e:
             import traceback; app.logger.error("Err: %s\n%s",e,traceback.format_exc())
-            try: reply_msg(tok,{"type":"text","text":"❌ error: {}".format(str(e)[:100])})
+            try: push_msg(cid,"❌ error: {}".format(str(e)[:200]))
             except: pass
     return "OK"
 
