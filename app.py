@@ -6,14 +6,13 @@ LINE Todo Bot v6 — LIFF Hybrid + Activity Log
 - สรุป: dropdown เลือกงานเสร็จ + ถังขยะลบ + ยืนยัน
 """
 
-import os, re, json, hashlib, hmac, base64
-from datetime import datetime, timezone, timedelta
+import os, re, json, sqlite3, hashlib, hmac, base64
+from datetime import datetime
 from contextlib import contextmanager
 
-TH_TZ = timezone(timedelta(hours=7))  # UTC+7 เวลาไทย
-
-import requests, psycopg2, psycopg2.extras
+import requests
 from flask import Flask, request, abort, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -22,25 +21,20 @@ LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LIFF_ID                   = os.environ.get("LIFF_ID", "")
 APP_URL                   = os.environ.get("APP_URL", "")
 LINE_API_URL              = "https://api.line.me/v2/bot"
-DATABASE_URL              = os.environ.get("DATABASE_URL", "")
+DAILY_SUMMARY_HOUR        = int(os.environ.get("DAILY_SUMMARY_HOUR", "18"))
+DAILY_SUMMARY_MINUTE      = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
+DATABASE_PATH             = os.environ.get("DATABASE_PATH", "todo.db")
 
 def lh():
     return {"Content-Type":"application/json","Authorization":"Bearer "+LINE_CHANNEL_ACCESS_TOKEN}
 def verify_sig(body, sig):
     h = hmac.new(LINE_CHANNEL_SECRET.encode(), body.encode(), hashlib.sha256).digest()
     return hmac.compare_digest(base64.b64encode(h).decode(), sig)
-def reply_msg(tok, msgs, _cid=None):
+def reply_msg(tok, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
     r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-    if r.status_code!=200:
-        app.logger.error("Reply err: %s %s", r.status_code, r.text)
-        # Flex message อาจถูก LINE reject → fallback ส่ง push_msg แจ้ง error
-        if _cid:
-            try:
-                err_detail = r.text[:200] if r.text else "unknown"
-                push_msg(_cid, "❌ LINE reject message ({}): {}".format(r.status_code, err_detail))
-            except: pass
+    if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
 def push_msg(to, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
@@ -52,260 +46,136 @@ def get_profile(uid):
     except: pass
     return ""
 
-# ── Database (PostgreSQL) ─────────────────────────────────────
+# ── Database ─────────────────────────────────────────────────
 @contextmanager
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    try: yield conn; conn.commit()
-    except: conn.rollback(); raise
-    finally: conn.close()
-
-def db_exec(conn, sql, params=None):
-    """Execute SQL — conn is the connection, uses cursor internally"""
-    cur = conn.cursor()
-    cur.execute(sql, params or ())
-    return cur
+    c = sqlite3.connect(DATABASE_PATH); c.row_factory = sqlite3.Row
+    try: yield c; c.commit()
+    finally: c.close()
 
 def init_db():
-    with get_db() as conn:
-        c = conn.cursor()
+    with get_db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-            id SERIAL PRIMARY KEY, chat_id TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
             title TEXT NOT NULL, added_by TEXT DEFAULT '', added_by_user_id TEXT DEFAULT '',
-            status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW(),
-            completed_at TIMESTAMP, due_date DATE,
-            assigned_to TEXT DEFAULT '', assigned_to_uid TEXT DEFAULT '')""")
+            assigned_to TEXT DEFAULT '', assigned_to_user_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME, due_date DATE)""")
+        for col in ["added_by_user_id","assigned_to","assigned_to_user_id"]:
+            try: c.execute("ALTER TABLE tasks ADD COLUMN {} TEXT DEFAULT ''".format(col))
+            except: pass
         c.execute("""CREATE TABLE IF NOT EXISTS comments (
-            id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
             chat_id TEXT NOT NULL, author TEXT DEFAULT '', author_user_id TEXT DEFAULT '',
-            content TEXT NOT NULL, created_at TIMESTAMP DEFAULT NOW())""")
+            content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        for col in ["author_user_id"]:
+            try: c.execute("ALTER TABLE comments ADD COLUMN {} TEXT DEFAULT ''".format(col))
+            except: pass
         c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
             chat_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT DEFAULT '',
             PRIMARY KEY (chat_id, user_id))""")
         c.execute("""CREATE TABLE IF NOT EXISTS pending_actions (
             user_chat_key TEXT PRIMARY KEY, action TEXT NOT NULL,
-            data TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW())""")
+            data TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
         c.execute("""CREATE TABLE IF NOT EXISTS activity_log (
-            id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
             chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
             action TEXT NOT NULL, detail TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT NOW())""")
-        # Backfill 1: งานเก่าที่ assigned_to ว่าง + มีชื่อ added_by → ใส่จาก added_by
-        c.execute("""UPDATE tasks SET assigned_to = added_by, assigned_to_uid = added_by_user_id
-                     WHERE (assigned_to IS NULL OR assigned_to = '')
-                       AND added_by IS NOT NULL AND added_by != ''""")
-        # Backfill 2: งานที่ assigned_to ว่าง + added_by ว่าง แต่มี added_by_user_id → ดึงชื่อจาก chat_members
-        c.execute("""UPDATE tasks t SET
-                       assigned_to = m.display_name,
-                       assigned_to_uid = t.added_by_user_id,
-                       added_by = m.display_name
-                     FROM chat_members m
-                     WHERE m.chat_id = t.chat_id AND m.user_id = t.added_by_user_id
-                       AND (t.assigned_to IS NULL OR t.assigned_to = '')
-                       AND t.added_by_user_id IS NOT NULL AND t.added_by_user_id != ''""")
-        # Backfill 3: งานที่มี assigned_to (ชื่อ) แต่ assigned_to_uid ว่าง → ดึง uid จาก chat_members
-        c.execute("""UPDATE tasks t SET assigned_to_uid = m.user_id
-                     FROM chat_members m
-                     WHERE m.chat_id = t.chat_id AND m.display_name = t.assigned_to
-                       AND (t.assigned_to_uid IS NULL OR t.assigned_to_uid = '')
-                       AND t.assigned_to IS NOT NULL AND t.assigned_to != ''""")
-        # ── Routines table ──
-        c.execute("""CREATE TABLE IF NOT EXISTS routines (
-            id SERIAL PRIMARY KEY,
-            chat_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            routine_type TEXT DEFAULT 'daily',
-            day_of_month INTEGER,
-            assigned_to TEXT DEFAULT '',
-            assigned_to_uid TEXT DEFAULT '',
-            created_by TEXT DEFAULT '',
-            created_by_uid TEXT DEFAULT '',
-            active BOOLEAN DEFAULT TRUE,
-            last_generated DATE,
-            created_at TIMESTAMP DEFAULT NOW())""")
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
 
 # ── Activity Log ─────────────────────────────────────────────
 def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO activity_log(task_id,chat_id,user_name,user_id,action,detail) VALUES(%s,%s,%s,%s,%s,%s)",
+    with get_db() as c:
+        c.execute("INSERT INTO activity_log(task_id,chat_id,user_name,user_id,action,detail) VALUES(?,?,?,?,?,?)",
                   (task_id, chat_id, user_name, user_id, action, detail))
 
 def get_activity_log(task_id, limit=20):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM activity_log WHERE task_id=%s ORDER BY created_at DESC LIMIT %s",
-            (task_id, limit))
-        return cur.fetchall()
+    with get_db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM activity_log WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+            (task_id, limit)).fetchall()]
 
 # ── Pending Actions ──────────────────────────────────────────
 def set_pending(uid, cid, act, data=""):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO pending_actions VALUES(%s,%s,%s,%s) ON CONFLICT (user_chat_key) DO UPDATE SET action=EXCLUDED.action, data=EXCLUDED.data, created_at=EXCLUDED.created_at",("{}:{}".format(uid,cid),act,data,datetime.now().isoformat()))
+    with get_db() as c:
+        c.execute("INSERT OR REPLACE INTO pending_actions VALUES(?,?,?,?)",("{}:{}".format(uid,cid),act,data,datetime.now().isoformat()))
 def get_pending(uid, cid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT action,data FROM pending_actions WHERE user_chat_key=%s",("{}:{}".format(uid,cid),))
-        r = cur.fetchone()
+    with get_db() as c:
+        r = c.execute("SELECT action,data FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),)).fetchone()
     return {"action":r["action"],"data":r["data"]} if r else None
 def clear_pending(uid, cid):
-    with get_db() as conn: cur = conn.cursor(); cur.execute("DELETE FROM pending_actions WHERE user_chat_key=%s",("{}:{}".format(uid,cid),))
-
-# ── Due Date Parser ──────────────────────────────────────────
-def parse_due_date(text):
-    """แยก due date ออกจาก text — format: วันที่ + งาน เช่น 'พรุ่งนี้ ส่งรายงาน' หรือ '30/03 ส่งเอกสาร'"""
-    from datetime import timedelta
-    today=datetime.now(TH_TZ).date()
-    # พรุ่งนี้/มะรืน
-    m=re.match(r'^(พรุ่งนี้|มะรืน|วันนี้|tomorrow|today)\s+(.+)',text,re.I)
-    if m:
-        w=m.group(1).lower()
-        if w in ["พรุ่งนี้","tomorrow"]: d=today+timedelta(days=1)
-        elif w in ["มะรืน"]: d=today+timedelta(days=2)
-        else: d=today
-        return d.strftime("%Y-%m-%d"), m.group(2).strip()
-    # dd/mm หรือ dd/mm/yyyy
-    m=re.match(r'^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\s+(.+)',text)
-    if m:
-        dd,mm=int(m.group(1)),int(m.group(2))
-        yy=int(m.group(3)) if m.group(3) else today.year
-        if yy<100: yy+=2000
-        try:
-            from datetime import date
-            d=date(yy,mm,dd)
-            return d.strftime("%Y-%m-%d"), m.group(4).strip()
-        except: pass
-    # จันทร์/อังคาร/... หน้า
-    days_th={"จันทร์":0,"อังคาร":1,"พุธ":2,"พฤหัส":3,"พฤหัสบดี":3,"ศุกร์":4,"เสาร์":5,"อาทิตย์":6}
-    m=re.match(r'^(จันทร์|อังคาร|พุธ|พฤหัส|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์)\s+(.+)',text)
-    if m:
-        target=days_th[m.group(1)]
-        current=today.weekday()
-        diff=(target-current)%7
-        if diff==0: diff=7
-        d=today+timedelta(days=diff)
-        return d.strftime("%Y-%m-%d"), m.group(2).strip()
-    return None, text
-
-def parse_date_only(text):
-    """Parse date from text (date only, no task title needed). Returns YYYY-MM-DD or None."""
-    from datetime import timedelta, date
-    today=datetime.now(TH_TZ).date()
-    t=text.strip().lower()
-    if t in ["พรุ่งนี้","tomorrow"]: return (today+timedelta(days=1)).strftime("%Y-%m-%d")
-    if t in ["มะรืน"]: return (today+timedelta(days=2)).strftime("%Y-%m-%d")
-    if t in ["วันนี้","today"]: return today.strftime("%Y-%m-%d")
-    m=re.match(r'^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$',t)
-    if m:
-        dd,mm=int(m.group(1)),int(m.group(2))
-        yy=int(m.group(3)) if m.group(3) else today.year
-        if yy<100: yy+=2000
-        try: return date(yy,mm,dd).strftime("%Y-%m-%d")
-        except: pass
-    days_th={"จันทร์":0,"อังคาร":1,"พุธ":2,"พฤหัส":3,"พฤหัสบดี":3,"ศุกร์":4,"เสาร์":5,"อาทิตย์":6}
-    for dn,dv in days_th.items():
-        if t==dn:
-            diff=(dv-today.weekday())%7
-            if diff==0: diff=7
-            return (today+timedelta(days=diff)).strftime("%Y-%m-%d")
-    return None
-
-def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
-    """Query pending tasks — ดูจาก assigned_to (ผู้รับผิดชอบ) + fallback งานเก่าที่ไม่มี assigned"""
-    with get_db() as conn:
-        cur = conn.cursor()
-        if uid:
-            # หา display_name จาก chat_members ถ้าไม่ได้ส่งมา
-            dname = name or ""
-            if not dname:
-                cur.execute("SELECT display_name FROM chat_members WHERE chat_id=%s AND user_id=%s",(cid,uid))
-                row = cur.fetchone()
-                if row: dname = row["display_name"]
-            # งานที่ assigned ให้คนนี้ (by uid) + งานเก่าที่ assigned ว่างแต่คนนี้สร้าง + งานที่ assigned by name แต่ uid ว่าง
-            sql=("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' "
-                 "AND (assigned_to_uid=%s "
-                 "OR (COALESCE(assigned_to_uid,'')='' AND added_by_user_id=%s)")
-            params=[cid, uid, uid]
-            if dname:
-                sql += " OR (COALESCE(assigned_to_uid,'')='' AND assigned_to=%s)"
-                params.append(dname)
-            sql += ")"
-        elif name:
-            sql="SELECT * FROM tasks WHERE chat_id=%s AND status='pending' AND assigned_to LIKE %s"
-            params=[cid, "%"+name+"%"]
-        else:
-            sql="SELECT * FROM tasks WHERE chat_id=%s AND status='pending'"
-            params=[cid]
-        if due_date:
-            sql+=" AND due_date=%s"
-            params.append(due_date)
-        sql+=" ORDER BY created_at"
-        cur.execute(sql, params)
-        return cur.fetchall()
-
-def set_due_date(tid, due):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE tasks SET due_date=%s WHERE id=%s",(due,tid))
+    with get_db() as c: c.execute("DELETE FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
 
 # ── Task CRUD ────────────────────────────────────────────────
-def add_task(cid, title, by="", by_uid="", assigned_to="", assigned_to_uid=""):
-    # ถ้าไม่ได้ assign ใคร → ผู้รับผิดชอบ = คนสร้างเอง
-    if not assigned_to:
-        assigned_to = by
-        assigned_to_uid = by_uid
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_uid) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",(cid,title.strip(),by,by_uid,assigned_to,assigned_to_uid))
-        tid = cur.fetchone()["id"]
+def add_task(cid, title, by="", by_uid="", assign_to="", assign_to_uid=""):
+    with get_db() as c:
+        cur = c.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_user_id) VALUES(?,?,?,?,?,?)",(cid,title.strip(),by,by_uid,assign_to,assign_to_uid))
+    tid = cur.lastrowid
     detail = "สร้างงาน: {}".format(title.strip())
-    if assigned_to and assigned_to != by: detail += " → มอบหมายให้ {}".format(assigned_to)
+    if assign_to: detail += " → มอบหมายให้ {}".format(assign_to)
     log_activity(tid, cid, by, by_uid, "created", detail)
     return get_task(tid)
 
 def get_task(tid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
-        r = cur.fetchone()
-    return r
+    with get_db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+    return dict(r) if r else None
 
 def get_pending_tasks(cid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' ORDER BY created_at",(cid,))
-        return cur.fetchall()
+    with get_db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' ORDER BY created_at",(cid,)).fetchall()]
 
 def get_completed_today(cid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='done' AND completed_at::date=%s ORDER BY completed_at",
-            (cid,datetime.now(TH_TZ).strftime("%Y-%m-%d")))
-        return cur.fetchall()
+    with get_db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='done' AND DATE(completed_at)=? ORDER BY completed_at",
+            (cid,datetime.now().strftime("%Y-%m-%d"))).fetchall()]
+
+def get_tasks_by_assignee(cid, assignee_uid="", assignee_name=""):
+    with get_db() as c:
+        if assignee_uid:
+            return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_user_id=? ORDER BY created_at",(cid,assignee_uid)).fetchall()]
+        elif assignee_name:
+            return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to=? ORDER BY created_at",(cid,assignee_name)).fetchall()]
+        return []
+
+def get_tasks_by_person(cid, uid="", name=""):
+    """Get all pending tasks related to a person (created by OR assigned to)"""
+    with get_db() as c:
+        if uid:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (added_by_user_id=? OR assigned_to_user_id=?) ORDER BY created_at",
+                (cid,uid,uid)).fetchall()]
+        elif name:
+            pat = "%{}%".format(name)
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (added_by LIKE ? OR assigned_to LIKE ?) ORDER BY created_at",
+                (cid,pat,pat)).fetchall()]
+        return []
+
+def find_member_by_name(cid, name_query):
+    """Find a chat member by partial name match"""
+    with get_db() as c:
+        pat = "%{}%".format(name_query)
+        rows = c.execute("SELECT user_id, display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?",(cid,pat)).fetchall()
+        return [dict(r) for r in rows]
 
 def complete_task(tid, by_name="", by_uid=""):
     result = None
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
-        r = cur.fetchone()
+    with get_db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r and r["status"]=="pending":
-            cur.execute("UPDATE tasks SET status='done',completed_at=%s WHERE id=%s",(datetime.now().isoformat(),tid))
-            result = r
+            c.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?",(datetime.now().isoformat(),tid))
+            result = dict(r)
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "completed", "ทำเสร็จ: {}".format(result["title"]))
     return result
 
 def edit_task(tid, new_title, by_name="", by_uid=""):
     result = None
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
-        r = cur.fetchone()
+    with get_db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
-            cur.execute("UPDATE tasks SET title=%s WHERE id=%s",(new_title.strip(),tid))
+            c.execute("UPDATE tasks SET title=? WHERE id=?",(new_title.strip(),tid))
             result = {"id":tid,"old":r["title"],"new":new_title.strip(),"chat_id":r["chat_id"]}
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "edited", "แก้ไข: {} → {}".format(result["old"], result["new"]))
@@ -313,127 +183,45 @@ def edit_task(tid, new_title, by_name="", by_uid=""):
 
 def delete_task(tid, by_name="", by_uid=""):
     result = None
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM tasks WHERE id=%s",(tid,))
-        r = cur.fetchone()
+    with get_db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
-            result = r
-            cur.execute("DELETE FROM comments WHERE task_id=%s",(tid,))
-            cur.execute("DELETE FROM tasks WHERE id=%s",(tid,))
+            result = dict(r)
+            c.execute("DELETE FROM comments WHERE task_id=?",(tid,))
+            c.execute("DELETE FROM tasks WHERE id=?",(tid,))
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "deleted", "ลบงาน: {}".format(result["title"]))
     return result
 
 def get_active_chats():
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT DISTINCT chat_id FROM tasks WHERE status='pending'")
-        return [r["chat_id"] for r in cur.fetchall()]
+    with get_db() as c:
+        return [r["chat_id"] for r in c.execute("SELECT DISTINCT chat_id FROM tasks WHERE status='pending'").fetchall()]
 
 def register_member(cid, uid, name=""):
-    with get_db() as conn: cur = conn.cursor(); cur.execute("INSERT INTO chat_members VALUES(%s,%s,%s) ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name=EXCLUDED.display_name",(cid,uid,name))
+    with get_db() as c: c.execute("INSERT OR REPLACE INTO chat_members VALUES(?,?,?)",(cid,uid,name))
 
 def get_task_index(cid, tid):
     for i,t in enumerate(get_pending_tasks(cid),1):
         if t["id"]==tid: return i
     return 0
 
-# ── Routine CRUD ────────────────────────────────────────────
-def add_routine(cid, title, routine_type="daily", day_of_month=None, assigned_to="", assigned_to_uid="", created_by="", created_by_uid=""):
-    if not assigned_to:
-        assigned_to = created_by
-        assigned_to_uid = created_by_uid
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO routines(chat_id,title,routine_type,day_of_month,assigned_to,assigned_to_uid,created_by,created_by_uid) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (cid, title.strip(), routine_type, day_of_month, assigned_to, assigned_to_uid, created_by, created_by_uid))
-        return cur.fetchone()["id"]
-
-def get_routines(cid, active_only=True):
-    with get_db() as conn:
-        cur = conn.cursor()
-        if active_only:
-            cur.execute("SELECT * FROM routines WHERE chat_id=%s AND active=TRUE ORDER BY routine_type, day_of_month NULLS FIRST, id", (cid,))
-        else:
-            cur.execute("SELECT * FROM routines WHERE chat_id=%s ORDER BY routine_type, day_of_month NULLS FIRST, id", (cid,))
-        return cur.fetchall()
-
-def get_routine(rid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM routines WHERE id=%s", (rid,))
-        return cur.fetchone()
-
-def delete_routine(rid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM routines WHERE id=%s", (rid,))
-        r = cur.fetchone()
-        if r:
-            cur.execute("DELETE FROM routines WHERE id=%s", (rid,))
-        return r
-
-def toggle_routine(rid, active=True):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE routines SET active=%s WHERE id=%s", (active, rid))
-
-def generate_routine_tasks(cid, uid, name):
-    """เข้างาน → สร้างงานจาก routine ที่ตรงวัน (daily + monthly ตรงวันที่)
-    Returns list of created task titles. ป้องกันซ้ำด้วย last_generated."""
-    today = datetime.now().date()
-    day = today.day
-    routines = get_routines(cid, active_only=True)
-    created = []
-    for r in routines:
-        # เช็คว่า routine นี้เป็นของ user นี้ไหม
-        if r["assigned_to_uid"] and r["assigned_to_uid"] != uid:
-            continue
-        if not r["assigned_to_uid"] and r["assigned_to"] and r["assigned_to"] != name:
-            continue
-        # เช็คประเภท
-        if r["routine_type"] == "monthly" and r.get("day_of_month") != day:
-            continue
-        # เช็คว่าสร้างไปแล้ววันนี้หรือยัง
-        lg = _to_date(r.get("last_generated"))
-        if lg and lg >= today:
-            continue
-        # สร้างงาน
-        t = add_task(cid, r["title"], by=name, by_uid=uid,
-                     assigned_to=r.get("assigned_to","") or name,
-                     assigned_to_uid=r.get("assigned_to_uid","") or uid)
-        set_due_date(t["id"], today.strftime("%Y-%m-%d"))
-        created.append(r["title"])
-        # อัพเดท last_generated
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE routines SET last_generated=%s WHERE id=%s", (today, r["id"]))
-    return created
-
 # ── Comments ─────────────────────────────────────────────────
 def add_comment(tid, cid, author, author_uid, content):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO comments(task_id,chat_id,author,author_user_id,content) VALUES(%s,%s,%s,%s,%s)",(tid,cid,author,author_uid,content))
+    with get_db() as c:
+        c.execute("INSERT INTO comments(task_id,chat_id,author,author_user_id,content) VALUES(?,?,?,?,?)",(tid,cid,author,author_uid,content))
     log_activity(tid, cid, author, author_uid, "commented", content[:50])
 
 def get_comments(tid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM comments WHERE task_id=%s ORDER BY created_at",(tid,))
-        return cur.fetchall()
+    with get_db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM comments WHERE task_id=? ORDER BY created_at",(tid,)).fetchall()]
 
 # ── Quick Reply ──────────────────────────────────────────────
 def qr():
     return {"items":[
-        {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
-        {"type":"action","action":{"type":"message","label":"🌆 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt","displayText":"➕ เพิ่มงาน"}},
-        {"type":"action","action":{"type":"message","label":"📋 ดูงาน","text":"ดูงาน"}},
-        {"type":"action","action":{"type":"message","label":"📌 งานค้าง","text":"งานค้าง"}},
-        {"type":"action","action":{"type":"message","label":"👥 งานทุกคน","text":"งานทุกคน"}},
-        {"type":"action","action":{"type":"message","label":"🔄 งานประจำ","text":"ดูงานประจำ"}},
+        {"type":"action","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list","displayText":"📋 ดูงาน"}},
+        {"type":"action","action":{"type":"postback","label":"📊 สรุป","data":"action=summary","displayText":"📊 สรุป"}},
+        {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -442,35 +230,26 @@ def aqr(msg):
     return msg
 
 def task_page_url(tid):
-    if LIFF_ID: return "https://liff.line.me/{}?task_id={}".format(LIFF_ID, tid)
     if APP_URL: return APP_URL.rstrip("/")+"/liff/task?task_id={}".format(tid)
-    return None
-
-def summary_page_url(cid):
-    if APP_URL: return APP_URL.rstrip("/")+"/liff/summary?chat_id={}".format(cid)
+    if LIFF_ID: return "https://liff.line.me/{}?task_id={}".format(LIFF_ID, tid)
     return None
 
 # ── Flex Cards ───────────────────────────────────────────────
 def build_mini_card(task, idx):
     tid = task["id"]; cc = len(get_comments(tid)); by = task.get("added_by","") or "-"
+    assign = task.get("assigned_to","")
     lu = task_page_url(tid)
     if lu:
-        # มี LIFF → ปุ่มเดียว เปิด LIFF จัดการทุกอย่างข้างใน
         footer_contents=[{"type":"button","action":{"type":"uri","label":"📖 เปิดดู / จัดการ","uri":lu},"style":"primary","height":"sm","color":"#1DB446"}]
     else:
         footer_contents=[
             {"type":"button","action":{"type":"postback","label":"📖 เปิดดู","data":"action=view_task&task_id={}".format(tid)},"style":"primary","height":"sm","color":"#1DB446"},
             {"type":"button","action":{"type":"postback","label":"✅ เสร็จ","data":"action=done&task_id={}".format(tid)},"style":"secondary","height":"sm","margin":"sm"}]
-    # แสดง comment ล่าสุดถ้ามี
     comments=get_comments(tid)
-    assigned=task.get("assigned_to","") or task.get("added_by","") or "-"
-    due=task.get("due_date","")
     body_contents=[
-        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"},
-        {"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assigned),"size":"xs","color":"#FF6B35","weight":"bold"}]
-    d=_to_date(due)
-    if d:
-        body_contents.append({"type":"text","text":"📅 กำหนด: {}".format(d.strftime("%d/%m/%y")),"size":"xs","color":"#0066CC"})
+        {"type":"text","text":"สั่งโดย: {}".format(by),"size":"xs","color":"#888888"}]
+    if assign:
+        body_contents.append({"type":"text","text":"👤 ผู้รับผิดชอบ: {}".format(assign),"size":"xs","color":"#E65100","weight":"bold","margin":"xs"})
     body_contents.append({"type":"text","text":"💬 {} comment".format(cc),"size":"xs","color":"#666666","margin":"sm"})
     if comments:
         c=comments[-1]; ts=""
@@ -493,6 +272,7 @@ def build_mini_card(task, idx):
 
 def build_full_card(task):
     tid=task["id"];cid=task["chat_id"];idx=get_task_index(cid,tid);by=task.get("added_by","") or "ไม่ระบุ"
+    assign=task.get("assigned_to","")
     ca=""
     if task.get("created_at"):
         try: ca=datetime.fromisoformat(task["created_at"]).strftime("%d/%m %H:%M")
@@ -500,14 +280,14 @@ def build_full_card(task):
     body=[
         {"type":"box","layout":"horizontal","contents":[
             {"type":"text","text":"สั่งโดย:","size":"xs","color":"#888888","flex":2},
-            {"type":"text","text":by,"size":"xs","color":"#333333","flex":5,"weight":"bold"}]},
-        {"type":"box","layout":"horizontal","contents":[
-            {"type":"text","text":"เมื่อ:","size":"xs","color":"#888888","flex":2},
-            {"type":"text","text":ca or "-","size":"xs","color":"#333333","flex":5}],"margin":"sm"}]
-    assigned=task.get("assigned_to","") or task.get("added_by","") or "-"
+            {"type":"text","text":by,"size":"xs","color":"#333333","flex":5,"weight":"bold"}]}]
+    if assign:
+        body.append({"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":"👤 ผู้รับผิดชอบ:","size":"xs","color":"#E65100","flex":2},
+            {"type":"text","text":assign,"size":"xs","color":"#E65100","flex":5,"weight":"bold"}],"margin":"sm"})
     body.append({"type":"box","layout":"horizontal","contents":[
-        {"type":"text","text":"👤 ผู้รับผิดชอบ:","size":"xs","color":"#888888","flex":2},
-        {"type":"text","text":assigned,"size":"xs","color":"#FF6B35","flex":5,"weight":"bold"}],"margin":"sm"})
+            {"type":"text","text":"เมื่อ:","size":"xs","color":"#888888","flex":2},
+            {"type":"text","text":ca or "-","size":"xs","color":"#333333","flex":5}],"margin":"sm"})
     comments=get_comments(tid)
     body.append({"type":"separator","margin":"lg"})
     body.append({"type":"text","text":"💬 ความคิดเห็น ({})".format(len(comments)),"size":"sm","weight":"bold","color":"#1DB446","margin":"lg"})
@@ -580,253 +360,63 @@ def build_list_flex(cid):
         return build_task_flex(p[0]["id"])
     return aqr({"type":"flex","altText":"📋 งานค้าง {} งาน".format(len(p)),"contents":{"type":"carousel","contents":[build_mini_card(t,i) for i,t in enumerate(p[:10],1)]}})
 
-def build_all_persons_flex(cid):
-    """งานทุกคน — แยก 1 คน = 1 bubble, carousel"""
-    p=get_pending_tasks(cid)
-    if not p: return aqr("🎉 ไม่มีงานค้างในกลุ่ม!")
-    # Group by ผู้รับผิดชอบ (assigned_to)
-    by_person={}
-    for t in p:
-        person=t.get("assigned_to","") or t.get("added_by","") or "ไม่ระบุ"
-        by_person.setdefault(person,[]).append(t)
-    bubbles=[]
-    colors=["#1DB446","#FF6B35","#5B5EA6","#E91E63","#009688","#FF9800","#795548","#607D8B"]
-    for idx,(person,tasks) in enumerate(by_person.items()):
-        color=colors[idx % len(colors)]
-        task_lines=[]
-        for i,t in enumerate(tasks,1):
-            due=t.get("due_date","")
-            dd=""
-            dv=_to_date(due)
-            if dv: dd=" [📅{}]".format(dv.strftime("%d/%m"))
-            task_lines.append({"type":"text","text":"{}. {}{}".format(i,t["title"],dd),"size":"sm","color":"#333333","wrap":True,"margin":"sm"})
-        bubble={"type":"bubble","size":"kilo",
-            "header":{"type":"box","layout":"vertical","contents":[
-                {"type":"text","text":"👤 {}".format(person),"weight":"bold","size":"md","color":"#FFFFFF"},
-                {"type":"text","text":"{} งานค้าง".format(len(tasks)),"size":"xs","color":"#FFFFFFCC"}
-            ],"paddingAll":"14px","backgroundColor":color},
-            "body":{"type":"box","layout":"vertical","contents":task_lines[:15],"paddingAll":"12px","spacing":"none"}}
-        bubbles.append(bubble)
-    return aqr({"type":"flex","altText":"📋 งานทุกคน ({} คน, {} งาน)".format(len(by_person),len(p)),
-        "contents":{"type":"carousel","contents":bubbles[:10]}})
-
-# ── Summary with interactive link ─────────────────────────────
+# ── Summary with checkboxes ─────────────────────────────────
 def build_summary(cid):
-    now=datetime.now(TH_TZ); done=get_completed_today(cid); pend=get_pending_tasks(cid)
+    now=datetime.now(); done=get_completed_today(cid); pend=get_pending_tasks(cid)
     di=[{"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True} for t in done] or [{"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"}]
+    # pending items with done+delete buttons — direct action, no confirm
     pi=[]
     for i,t in enumerate(pend,1):
-        pi.append({"type":"text","text":"  {}. {}".format(i,t["title"]),"size":"xs","color":"#FF6B35","wrap":True})
+        assign=t.get("assigned_to","")
+        label="{}. {}".format(i,t["title"])
+        if assign: label="{}. {} [{}]".format(i,t["title"],assign)
+        pi.append({"type":"box","layout":"horizontal","contents":[
+            {"type":"button","action":{"type":"postback","label":"☑️","data":"action=done_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center"},
+            {"type":"text","text":label,"size":"xs","color":"#FF6B35","wrap":True,"flex":5,"gravity":"center","margin":"sm"},
+            {"type":"button","action":{"type":"postback","label":"🗑️","data":"action=delete_refresh&task_id={}".format(t["id"])},"style":"secondary","height":"sm","flex":0,"gravity":"center","margin":"sm"},
+        ],"margin":"sm"})
     if not pi: pi.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
     if done and not pend: st,sc="🏆 ยอดเยี่ยม!","#1DB446"
     elif done: st,sc="👍 เสร็จ {} ค้าง {}".format(len(done),len(pend)),"#FF8C00"
     else: st,sc="💪 พรุ่งนี้สู้ใหม่!","#FF6B35"
-    su=summary_page_url(cid)
-    footer_contents=[{"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","align":"center"}]
-    if su and pend:
-        footer_contents.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#1DB446","height":"sm","margin":"lg"})
-    body_contents=[
-        {"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(done)),"weight":"bold","size":"sm","color":"#1DB446"},
-    ]+di+[
-        {"type":"separator","margin":"lg"},
-        {"type":"text","text":"⏳ งานค้าง ({})".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"lg"},
-    ]+pi
     return aqr({"type":"flex","altText":"📊 สรุป","contents":{"type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","contents":[
             {"type":"text","text":"📊 สรุปประจำวัน","weight":"bold","size":"lg","color":"#333333"},
             {"type":"text","text":now.strftime("%d/%m/%Y"),"size":"sm","color":"#999999"},
         ],"paddingAll":"15px","backgroundColor":"#FFF9E6"},
-        "body":{"type":"box","layout":"vertical","contents":body_contents,"paddingAll":"15px","spacing":"sm"},
-        "footer":{"type":"box","layout":"vertical","contents":footer_contents,"paddingAll":"12px"}}})
+        "body":{"type":"box","layout":"vertical","contents":[
+            {"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(done)),"weight":"bold","size":"sm","color":"#1DB446"},
+        ]+di+[
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"⏳ งานค้าง ({}) — กด ☑️ เสร็จ / 🗑️ ลบ".format(len(pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"lg"},
+        ]+pi+[
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","margin":"lg","align":"center"},
+        ],"paddingAll":"15px","spacing":"sm"}}})
 
-def get_tasks_by_person(cid):
-    """แยกงานตามคน — ดูจาก assigned_to ถ้าไม่มีใช้ added_by"""
-    pend=get_pending_tasks(cid)
-    by_person={}
-    for t in pend:
-        person=t.get("assigned_to","") or t.get("added_by","") or "ไม่ระบุ"
-        by_person.setdefault(person,[]).append(t)
-    return pend, by_person
-
-def _to_date(v):
-    """Convert due_date value to datetime.date for comparison (handles both date obj and string)"""
-    if not v: return None
-    if hasattr(v, 'year'): return v  # already datetime.date
-    try: return datetime.strptime(str(v), "%Y-%m-%d").date()
-    except: return None
-
-def get_today_tasks(cid):
-    """งานที่ due วันนี้ + งานค้างที่ไม่มี due"""
-    today=datetime.now(TH_TZ).date()
-    pend=get_pending_tasks(cid)
-    today_tasks=[t for t in pend if _to_date(t.get("due_date"))==today]
-    no_due=[t for t in pend if not t.get("due_date")]
-    overdue=[t for t in pend if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))<today]
-    future=[t for t in pend if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))>today]
-    return today_tasks, no_due, overdue, future
-
-def build_clockin(cid, uid="", name=""):
-    """เข้างาน — สร้างงาน routine อัตโนมัติ + แสดงเฉพาะงานของผู้ส่ง"""
-    try:
-        return _build_clockin_inner(cid, uid, name)
-    except Exception as e:
-        import traceback
-        app.logger.error("clockin err: %s\n%s", e, traceback.format_exc())
-        return aqr("❌ เข้างาน error: {}".format(str(e)[:150]))
-
-def _build_clockin_inner(cid, uid="", name=""):
-    now=datetime.now(TH_TZ)
-    today=now.date()
-    # Auto-create routine tasks
-    routine_created = generate_routine_tasks(cid, uid, name) if uid else []
-    my=query_tasks_by_person(cid, uid=uid)
-    overdue=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))<today]
-    today_tasks=[t for t in my if _to_date(t.get("due_date"))==today]
-    no_due=[t for t in my if not t.get("due_date")]
-    future=[t for t in my if _to_date(t.get("due_date")) and _to_date(t.get("due_date"))>today]
-    body=[]
-    # แสดง routine ที่สร้างอัตโนมัติ
-    if routine_created:
-        body.append({"type":"text","text":"🔄 Routine สร้างอัตโนมัติ ({})".format(len(routine_created)),"weight":"bold","size":"sm","color":"#6366F1","margin":"md"})
-        for rt in routine_created:
-            body.append({"type":"text","text":"  ✨ {}".format(rt),"size":"xs","color":"#6366F1","wrap":True})
-        body.append({"type":"separator","margin":"md"})
-    # งาน overdue
-    if overdue:
-        body.append({"type":"text","text":"🔴 งานเลยกำหนด ({})".format(len(overdue)),"weight":"bold","size":"sm","color":"#E53935","margin":"md"})
-        for t in overdue:
-            d=_to_date(t.get("due_date"))
-            dd=d.strftime("%d/%m") if d else "-"
-            body.append({"type":"text","text":"  ⚠️ {} (📅{})".format(t["title"],dd),"size":"xs","color":"#E53935","wrap":True})
-        body.append({"type":"separator","margin":"md"})
-    # งานวันนี้ + ไม่มีกำหนด
-    all_today=today_tasks+no_due
-    body.append({"type":"text","text":"📋 งานวันนี้ ({})".format(len(all_today)),"weight":"bold","size":"sm","color":"#1DB446","margin":"md"})
-    if not all_today:
-        body.append({"type":"text","text":"  — ไม่มีงานวันนี้ 🎉","size":"xs","color":"#999999"})
-    for t in all_today:
-        body.append({"type":"text","text":"  ⬜ {}".format(t["title"]),"size":"xs","color":"#333333","wrap":True})
-    # งานกำหนดล่วงหน้า
-    if future:
-        body.append({"type":"separator","margin":"lg"})
-        body.append({"type":"text","text":"📅 กำหนดไว้ ({})".format(len(future)),"weight":"bold","size":"sm","color":"#1976D2","margin":"md"})
-        for t in future[:5]:
-            d=_to_date(t.get("due_date"))
-            dd=d.strftime("%d/%m") if d else "-"
-            body.append({"type":"text","text":"  📆 {} — {}".format(dd,t["title"]),"size":"xs","color":"#1976D2","wrap":True})
-        if len(future)>5:
-            body.append({"type":"text","text":"  ...อีก {} งาน".format(len(future)-5),"size":"xs","color":"#999999"})
-    # สรุปจำนวน
-    total=len(my)
-    body.append({"type":"separator","margin":"lg"})
-    body.append({"type":"text","text":"📊 รวม {} งานค้าง".format(total),"size":"sm","color":"#FF6B35","weight":"bold","margin":"md","align":"center"})
-    su=summary_page_url(cid)
-    footer_c=[{"type":"text","text":"💪 สู้ๆ วันนี้!","size":"sm","color":"#1DB446","align":"center","weight":"bold"}]
-    if su and my:
-        footer_c.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#1DB446","height":"sm","margin":"lg"})
-    dname=name or "คุณ"
-    return aqr({"type":"flex","altText":"🌅 เข้างาน","contents":{"type":"bubble","size":"mega",
+def build_clockin(cid):
+    now=datetime.now(); pend=get_pending_tasks(cid)
+    items=[]
+    for i,t in enumerate(pend,1):
+        items.append({"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":"{}".format(i),"size":"sm","color":"#1DB446","flex":0,"weight":"bold"},
+            {"type":"text","text":"⬜ {}".format(t["title"]),"size":"sm","wrap":True,"margin":"md"}],"margin":"md"})
+    if not items: items.append({"type":"text","text":"🎉 ไม่มีงานค้าง!","size":"sm","color":"#1DB446"})
+    return aqr({"type":"flex","altText":"🌅 เข้างาน","contents":{"type":"bubble",
         "header":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"🌅 เข้างาน — {}".format(dname),"weight":"bold","size":"lg","color":"#1DB446"},
+            {"type":"text","text":"🌅 สวัสดีตอนเช้า!","weight":"bold","size":"lg","color":"#1DB446"},
             {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
         ],"paddingAll":"15px","backgroundColor":"#F5FFF5"},
-        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
-        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"12px"}}})
-
-def build_clockout(cid, uid="", name=""):
-    """เลิกงาน — สรุปเฉพาะงานของผู้ส่ง (เสร็จวันนี้ + งานค้าง)"""
-    try:
-        return _build_clockout_inner(cid, uid, name)
-    except Exception as e:
-        import traceback
-        app.logger.error("clockout err: %s\n%s", e, traceback.format_exc())
-        return aqr("❌ เลิกงาน error: {}".format(str(e)[:150]))
-
-def _build_clockout_inner(cid, uid="", name=""):
-    now=datetime.now(TH_TZ)
-    # งานที่เสร็จวันนี้ของผู้ส่ง
-    all_done=get_completed_today(cid)
-    # filter เฉพาะงานของผู้ส่ง: assigned_to_uid ตรง หรือ assigned ว่างแต่เป็นคนสร้าง
-    my_done=[t for t in all_done if t.get("assigned_to_uid")==uid or (not t.get("assigned_to_uid") and t.get("added_by_user_id")==uid)] if uid else all_done
-    # งานค้างของผู้ส่ง
-    my_pend=query_tasks_by_person(cid, uid=uid)
-    body=[]
-    # งานเสร็จวันนี้
-    body.append({"type":"text","text":"✅ เสร็จวันนี้ ({})".format(len(my_done)),"weight":"bold","size":"sm","color":"#1DB446"})
-    if my_done:
-        for t in my_done:
-            body.append({"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True})
-    else:
-        body.append({"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"})
-    # งานค้าง
-    body.append({"type":"separator","margin":"lg"})
-    body.append({"type":"text","text":"⏳ งานค้าง ({})".format(len(my_pend)),"weight":"bold","size":"sm","color":"#FF6B35","margin":"md"})
-    if my_pend:
-        today_d=now.date()
-        for i,t in enumerate(my_pend,1):
-            d=_to_date(t.get("due_date"))
-            tag=""
-            if d and d<today_d: tag=" 🔴เลยกำหนด"
-            elif d: tag=" [📅{}]".format(d.strftime("%d/%m"))
-            body.append({"type":"text","text":"  {}. {}{}".format(i,t["title"],tag),"size":"xs","color":"#FF6B35","wrap":True})
-    else:
-        body.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
-    # สถานะ (แสดงใน footer)
-    if my_done and not my_pend: st,sc="🏆 ยอดเยี่ยม! เคลียร์หมดแล้ว","#1DB446"
-    elif my_done: st,sc="👍 เสร็จ {} ค้าง {}".format(len(my_done),len(my_pend)),"#FF8C00"
-    else: st,sc="💪 พรุ่งนี้สู้ใหม่!","#FF6B35"
-    su=summary_page_url(cid)
-    footer_c=[{"type":"text","text":st,"size":"sm","color":sc,"align":"center","weight":"bold"}]
-    if su and my_pend:
-        footer_c.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#FF6B35","height":"sm","margin":"lg"})
-    dname=name or "คุณ"
-    return aqr({"type":"flex","altText":"🌆 เลิกงาน","contents":{"type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"🌆 เลิกงาน — {}".format(dname),"weight":"bold","size":"lg","color":"#FF6B35"},
-            {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
-        ],"paddingAll":"15px","backgroundColor":"#FFF3E0"},
-        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
-        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"12px"}}})
-
-def build_routine_list(cid):
-    """แสดงรายการงานประจำทั้งหมดในกลุ่ม"""
-    rlist=get_routines(cid, active_only=False)
-    if not rlist: return aqr("📭 ยังไม่มีงานประจำ\n\nใช้คำสั่ง:\n  ตั้งงานประจำวัน งาน1,งาน2\n  ตั้งงานประจำเดือน 25 งาน1,งาน2")
-    daily=[r for r in rlist if r["routine_type"]=="daily"]
-    monthly=[r for r in rlist if r["routine_type"]=="monthly"]
-    body=[]
-    idx=1
-    if daily:
-        body.append({"type":"text","text":"🔁 งานประจำวัน (Daily)","weight":"bold","size":"sm","color":"#4ADE80","margin":"md"})
-        for r in daily:
-            status="✅" if r.get("active") else "⏸️"
-            body.append({"type":"text","text":"  {}. {} {} — 👤{}".format(idx, status, r["title"], r.get("assigned_to","") or "?"),"size":"xs","color":"#333333","wrap":True})
-            idx+=1
-    if monthly:
-        if daily: body.append({"type":"separator","margin":"md"})
-        body.append({"type":"text","text":"📅 งานประจำเดือน (Monthly)","weight":"bold","size":"sm","color":"#F59E0B","margin":"md"})
-        for r in monthly:
-            status="✅" if r.get("active") else "⏸️"
-            dom=r.get("day_of_month","?")
-            body.append({"type":"text","text":"  {}. {} {} — วันที่ {} 👤{}".format(idx, status, r["title"], dom, r.get("assigned_to","") or "?"),"size":"xs","color":"#333333","wrap":True})
-            idx+=1
-    body.append({"type":"separator","margin":"lg"})
-    body.append({"type":"text","text":"พิมพ์ ลบงานประจำ # เพื่อลบ","size":"xxs","color":"#999999","align":"center","margin":"sm"})
-    ru=routine_page_url(cid)
-    footer_c=[]
-    if ru:
-        footer_c.append({"type":"button","action":{"type":"uri","label":"🔄 จัดการงานประจำ","uri":ru},"style":"primary","color":"#6366F1","height":"sm"})
-    return aqr({"type":"flex","altText":"🔄 งานประจำ {} รายการ".format(len(rlist)),"contents":{"type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"vertical","contents":[
-            {"type":"text","text":"🔄 งานประจำในกลุ่ม","weight":"bold","size":"lg","color":"#FFFFFF"},
-            {"type":"text","text":"{} รายการ".format(len(rlist)),"size":"xs","color":"#FFFFFFCC"}
-        ],"paddingAll":"15px","backgroundColor":"#6366F1"},
-        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
-        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"10px"} if footer_c else None}})
-
-def routine_page_url(cid):
-    if APP_URL: return APP_URL.rstrip("/")+"/liff/routines?chat_id={}".format(cid)
-    return None
+        "body":{"type":"box","layout":"vertical","contents":[
+            {"type":"text","text":"📋 งานวันนี้ ({} งาน)".format(len(pend)),"weight":"bold","size":"sm"},
+            {"type":"separator","margin":"md"}]+items+[
+            {"type":"separator","margin":"lg"},
+            {"type":"text","text":"💪 สู้ๆ นะครับ!","size":"sm","color":"#1DB446","margin":"lg","align":"center"}
+        ],"paddingAll":"15px"},
+        "footer":{"type":"box","layout":"horizontal","contents":[
+            {"type":"button","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list"},"style":"primary","height":"sm","color":"#1DB446"},
+            {"type":"button","action":{"type":"postback","label":"➕ เพิ่มงาน","data":"action=add_prompt"},"style":"secondary","height":"sm","margin":"sm"}
+        ],"paddingAll":"10px"}}})
 
 def build_help():
     return aqr({"type":"flex","altText":"📖 วิธีใช้","contents":{"type":"bubble",
@@ -843,80 +433,46 @@ def build_help():
             {"type":"separator","margin":"lg"},
             {"type":"text","text":"📊 สรุป → กด ☑️ เสร็จ / 🗑️ ลบ ได้เลย","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"separator","margin":"lg"},
+            {"type":"text","text":"@ดูงาน → ดูงานค้างของตัวเอง","weight":"bold","size":"sm","color":"#1565C0","margin":"lg"},
+            {"type":"text","text":"@ชื่อ งาน → ดูงานค้างของคนนั้น","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"separator","margin":"lg"},
             {"type":"text","text":"📋 Activity Log ทุกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
             {"type":"text","text":"ดูย้อนหลังว่าใครทำอะไรเมื่อไหร่","size":"xs","color":"#666666","margin":"sm"},
             {"type":"separator","margin":"lg"},
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"📌 @ชื่อ เพิ่ม ชื่องาน → มอบหมาย","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"เช่น: @สมชาย เพิ่ม ส่งรายงาน,เตรียมเอกสาร","size":"xs","color":"#666666","margin":"sm"},
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"📌 @ชื่อ งาน → เช็คงานของคนนั้น","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"เช่น: @สมชาย งาน","size":"xs","color":"#666666","margin":"sm"},
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"➕ เพิ่มหลายงาน + กำหนดวัน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"เช่น: เพิ่ม งาน1,งาน2,งาน3","size":"xs","color":"#666666","margin":"sm"},
-            {"type":"text","text":"📅 หลายวัน:","size":"xs","color":"#666666","margin":"sm"},
-            {"type":"text","text":"เพิ่ม\\nพรุ่งนี้ งาน1,งาน2\\n30/03 งาน3\\nศุกร์ งาน4","size":"xs","color":"#666666","margin":"sm"},
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"📋 ดูงาน → งานของฉัน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"📋 งาน@ชื่อ / @ชื่อ งาน → งานคนอื่น","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
-            {"type":"text","text":"📋 งานทุกคน → ดูงานทุกคนในกลุ่ม","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
-            {"type":"text","text":"📊 สรุปงาน / สรุปงาน@ชื่อ","weight":"bold","size":"sm","color":"#1DB446","margin":"sm"},
-            {"type":"separator","margin":"lg"},
-            {"type":"text","text":"🌅 เข้างาน / 🌆 เลิกงาน","weight":"bold","size":"sm","color":"#1DB446","margin":"lg"},
-            {"type":"text","text":"เข้างาน → ดูงานวันนี้ / เลิกงาน → สรุปผล","size":"xs","color":"#666666","margin":"sm"},
+            {"type":"text","text":"⏰ auto สรุปทุกวัน 18:00","size":"xs","color":"#999999","margin":"lg","align":"center"},
         ],"paddingAll":"15px"}}})
 
-# ── Multi-date task parser ────────────────────────────────────
-DATE_LINE_RE=re.compile(
-    r'^(พรุ่งนี้|มะรืน|วันนี้|tomorrow|today'
-    r'|\d{1,2}/\d{1,2}(?:/\d{2,4})?'
-    r'|จันทร์|อังคาร|พุธ|พฤหัส|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์)\s+(.+)',
-    re.I)
-
-def _parse_and_add_tasks(raw, cid, name, uid, assigned_to="", assigned_to_uid=""):
-    """Parse raw text that may contain multi-date blocks and add tasks.
-    Supported formats:
-      1) Single line: งาน1,งาน2  (no date)
-      2) Single line with date: พรุ่งนี้ งาน1,งาน2
-      3) Multi-line with date headers:
-           พรุ่งนี้ งาน1,งาน2
-           30/03 งาน3,งาน4
-           ศุกร์ งาน5
-    """
-    lines=raw.split("\n")
-    lines=[l.strip() for l in lines]
-    lines=[l for l in lines if l]
-
-    added=[]
-    for line in lines:
-        dm=DATE_LINE_RE.match(line)
-        if dm:
-            date_part=dm.group(1)
-            tasks_part=dm.group(2)
-            due,_=parse_due_date(date_part+" dummy")
-            sub_items=re.split(r'[,]+', tasks_part)
-            sub_items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in sub_items]
-            sub_items=[x for x in sub_items if x]
-            for title in sub_items:
-                t=add_task(cid,title,by=name,by_uid=uid,assigned_to=assigned_to,assigned_to_uid=assigned_to_uid)
-                if due: set_due_date(t["id"],due)
-                added.append(get_task(t["id"]))
-        else:
-            sub_items=re.split(r'[,]+', line)
-            sub_items=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in sub_items]
-            sub_items=[x for x in sub_items if x]
-            for it in sub_items:
-                due,title=parse_due_date(it)
-                if not title.strip(): continue
-                t=add_task(cid,title,by=name,by_uid=uid,assigned_to=assigned_to,assigned_to_uid=assigned_to_uid)
-                if due: set_due_date(t["id"],due)
-                added.append(get_task(t["id"]))
-    return added
+def build_person_tasks(person_name, tasks, is_self=False):
+    """Build Flex card showing a person's pending tasks"""
+    label = "📋 งานของฉัน" if is_self else "📋 งานของ {}".format(person_name)
+    if not tasks:
+        return aqr({"type":"flex","altText":label,"contents":{"type":"bubble","size":"kilo",
+            "body":{"type":"box","layout":"vertical","backgroundColor":"#FFF8E1","cornerRadius":"lg","paddingAll":"lg","contents":[
+                {"type":"text","text":"📋 ไม่พบงานค้าง","weight":"bold","size":"md","color":"#F57F17","align":"center"},
+                {"type":"text","text":"ของ {}".format("คุณ" if is_self else person_name),"size":"sm","color":"#666","align":"center","margin":"sm"}
+            ]}}})
+    items = []
+    for i, t in enumerate(tasks, 1):
+        lu = task_page_url(t["id"])
+        row = [
+            {"type":"text","text":"{}. {}".format(i, t["title"]),"size":"sm","weight":"bold","color":"#333","flex":4,"wrap":True},
+        ]
+        if t.get("added_by"): row.append({"type":"text","text":"by {}".format(t["added_by"]),"size":"xxs","color":"#999","flex":2,"align":"end"})
+        item = {"type":"box","layout":"horizontal","contents":row,"margin":"md"}
+        if lu:
+            item["action"] = {"type":"uri","label":"เปิด","uri":lu}
+        items.append(item)
+        if i < len(tasks): items.append({"type":"separator","margin":"sm","color":"#E0E0E0"})
+    return aqr({"type":"flex","altText":label,"contents":{"type":"bubble",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#E3F2FD","paddingAll":"12px","contents":[
+            {"type":"text","text":label,"weight":"bold","size":"md","color":"#1565C0"},
+            {"type":"text","text":"📌 {} งานค้าง".format(len(tasks)),"size":"xs","color":"#666","margin":"sm"}
+        ]},
+        "body":{"type":"box","layout":"vertical","paddingAll":"12px","contents":items}}})
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","สรุปงาน","งานทุกคน","เข้างาน","clock in","เลิกงาน","clock out","งานงาน","วิธีใช้","เมนู","menu","ตั้งงานประจำวัน","ตั้งงานประจำเดือน","ดูงานประจำ","ลบงานประจำ","งานประจำ"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu","@ดูงาน"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -935,212 +491,31 @@ def process_text(text, cid, uid="", name=""):
                 if t and t["chat_id"]==cid: add_comment(tid,cid,name,uid,ts); return build_task_flex(tid)
                 return aqr("❌ ไม่พบงานนี้")
 
-    if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid, uid, name)
-    if tl in ["เลิกงาน","clock out"]: return build_clockout(cid, uid, name)
+    if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid)
 
-    # ── Routine Commands ──
-    # ตั้งงานประจำวัน งาน1,งาน2
-    mr=re.match(r"^ตั้งงานประจำวัน\s+(.+)",ts,re.I)
-    if mr:
-        items=[x.strip() for x in re.split(r'[,，]+', mr.group(1)) if x.strip()]
-        ids=[]
-        for title in items:
-            rid=add_routine(cid, title, routine_type="daily", assigned_to=name, assigned_to_uid=uid, created_by=name, created_by_uid=uid)
-            ids.append(title)
-        if ids:
-            return aqr("✅ ตั้งงานประจำ*วัน*แล้ว {} รายการ\n\n🔁 Daily Routine:\n{}\n\n👤 ผู้รับผิดชอบ: {}\n\n_จะถูกเพิ่มอัตโนมัติทุกวันตอน \"เข้างาน\"_".format(
-                len(ids), "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(ids,1)]), name or "คุณ"))
-        return aqr("❌ ไม่พบชื่องาน")
+    # @ดูงาน → ดูงานค้างของตัวเอง
+    if tl in ["@ดูงาน","@งานของฉัน","@mywork","@mytasks","งานของฉัน"]:
+        tasks = get_tasks_by_person(cid, uid=uid)
+        return build_person_tasks(name or "ฉัน", tasks, is_self=True)
 
-    # @ชื่อ ตั้งงานประจำวัน งาน1,งาน2
-    mr=re.match(r"^@(\S+)\s+ตั้งงานประจำวัน\s+(.+)",ts,re.I)
-    if mr:
-        aname=mr.group(1).strip(); auid=""
-        with get_db() as conn:
-            cur=conn.cursor()
-            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s",(cid,"%"+aname+"%"))
-            m2=cur.fetchone()
-            if m2: aname=m2["display_name"]; auid=m2["user_id"]
-        items=[x.strip() for x in re.split(r'[,，]+', mr.group(2)) if x.strip()]
-        for title in items:
-            add_routine(cid, title, routine_type="daily", assigned_to=aname, assigned_to_uid=auid, created_by=name, created_by_uid=uid)
-        return aqr("✅ ตั้งงานประจำ*วัน*ให้ {} แล้ว {} รายการ\n\n🔁 Daily Routine:\n{}".format(
-            aname, len(items), "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)])))
-
-    # ตั้งงานประจำเดือน 25 งาน1,งาน2
-    mr=re.match(r"^ตั้งงานประจำเดือน\s+(\d{1,2})\s+(.+)",ts,re.I)
-    if mr:
-        dom=int(mr.group(1))
-        if dom<1 or dom>31: return aqr("❌ วันที่ต้องอยู่ระหว่าง 1-31")
-        items=[x.strip() for x in re.split(r'[,，]+', mr.group(2)) if x.strip()]
-        for title in items:
-            add_routine(cid, title, routine_type="monthly", day_of_month=dom, assigned_to=name, assigned_to_uid=uid, created_by=name, created_by_uid=uid)
-        return aqr("✅ ตั้งงานประจำ*เดือน*แล้ว {} รายการ\n\n📅 วันที่ {} ของทุกเดือน:\n{}\n\n👤 ผู้รับผิดชอบ: {}".format(
-            len(items), dom, "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)]), name or "คุณ"))
-
-    # @ชื่อ ตั้งงานประจำเดือน 25 งาน1,งาน2
-    mr=re.match(r"^@(\S+)\s+ตั้งงานประจำเดือน\s+(\d{1,2})\s+(.+)",ts,re.I)
-    if mr:
-        aname=mr.group(1).strip(); dom=int(mr.group(2)); auid=""
-        if dom<1 or dom>31: return aqr("❌ วันที่ต้องอยู่ระหว่าง 1-31")
-        with get_db() as conn:
-            cur=conn.cursor()
-            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s",(cid,"%"+aname+"%"))
-            m2=cur.fetchone()
-            if m2: aname=m2["display_name"]; auid=m2["user_id"]
-        items=[x.strip() for x in re.split(r'[,，]+', mr.group(3)) if x.strip()]
-        for title in items:
-            add_routine(cid, title, routine_type="monthly", day_of_month=dom, assigned_to=aname, assigned_to_uid=auid, created_by=name, created_by_uid=uid)
-        return aqr("✅ ตั้งงานประจำ*เดือน*ให้ {} แล้ว {} รายการ\n\n📅 วันที่ {} ของทุกเดือน:\n{}".format(
-            aname, len(items), dom, "\n".join(["  {}. {}".format(i,t) for i,t in enumerate(items,1)])))
-
-    # ดูงานประจำ
-    if tl in ["ดูงานประจำ","งานประจำ","routine","routines"]:
-        return build_routine_list(cid)
-
-    # ลบงานประจำ #
-    mr=re.match(r"^ลบงานประจำ\s*(\d+)",ts,re.I)
-    if mr:
-        rlist=get_routines(cid, active_only=False)
-        idx=int(mr.group(1))
-        if 1<=idx<=len(rlist):
-            r=rlist[idx-1]
-            delete_routine(r["id"])
-            return aqr("🗑️ ลบงานประจำแล้ว: {}".format(r["title"]))
-        return aqr("❌ ไม่พบงานประจำ #{}".format(idx))
-
-    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
+    # @ชื่อ งาน → ดูงานค้างของคนนั้น
+    m = re.match(r"^@(.+?)\s*(?:งาน|tasks?|work)$", ts)
     if m:
-        raw=m.group(1).strip()
-        added=_parse_and_add_tasks(raw, cid, name, uid)
-        if len(added)==1:
-            return build_task_flex(added[0]["id"])
-        if len(added)>1:
-            cards=[build_mini_card(t,i) for i,t in enumerate(added,1)]
-            return aqr({"type":"flex","altText":"➕ เพิ่ม {} งาน".format(len(added)),"contents":{"type":"carousel","contents":cards[:10]}})
-        return aqr("❌ ไม่พบชื่องาน")
+        query_name = m.group(1).strip()
+        members = find_member_by_name(cid, query_name)
+        if members:
+            mem = members[0]
+            tasks = get_tasks_by_person(cid, uid=mem["user_id"])
+            return build_person_tasks(mem["display_name"], tasks)
+        else:
+            tasks = get_tasks_by_person(cid, name=query_name)
+            return build_person_tasks(query_name, tasks)
+
+    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I)
+    if m: t=add_task(cid,m.group(1).strip(),by=name,by_uid=uid); return build_task_flex(t["id"])
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
-    # @ชื่อ เพิ่ม งาน1,งาน2 → มอบหมายงานให้คนอื่น (รองรับ multi-date)
-    am=re.match(r"^@(\S+)\s+(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
-    if am:
-        aname=am.group(1).strip(); atitle=am.group(2).strip()
-        auid=""
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+aname+"%"))
-            mr=cur.fetchone()
-            if mr: aname=mr["display_name"]; auid=mr["user_id"]
-        added=_parse_and_add_tasks(atitle, cid, name, uid, assigned_to=aname, assigned_to_uid=auid)
-        if len(added)==1:
-            return aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(added[0]["title"],aname))
-        if len(added)>1:
-            return aqr("📌 มอบหมาย {} งาน ให้ {} แล้ว\n{}".format(len(added),aname,"\n".join(["  {}. {}".format(i,t["title"]) for i,t in enumerate(added,1)])))
-        return aqr("❌ ไม่พบชื่องาน")
-    # ── ดูงาน / งาน@ชื่อ / สรุปงาน / สรุปงาน@ชื่อ (+ optional date) ──
-    # Helper: resolve @name to uid+display
-    def _resolve_name(n):
-        rn=n; ru=""
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s AND display_name LIKE %s", (cid, "%"+n+"%"))
-            mr=cur.fetchone()
-            if mr: rn=mr["display_name"]; ru=mr["user_id"]
-        return rn, ru
-
-    def _show_tasks(tasks, label, date_str=None):
-        if not tasks: return aqr("🎉 ไม่มีงานค้าง{}{}".format(" ของ "+label if label!="ฉัน" else "ของคุณ"," ("+date_str+")" if date_str else ""))
-        cards=[build_mini_card(dict(t),i) for i,t in enumerate(tasks,1)]
-        alt="📋 งาน{} {} งาน".format("ของ "+label if label!="ฉัน" else "ของฉัน",len(tasks))
-        return aqr({"type":"flex","altText":alt,"contents":{"type":"carousel","contents":cards[:10]}})
-
-    # Pattern: @ชื่อ งาน [date] — e.g. "@Sun งาน", "@Sun งาน 30/03"
-    am2=re.match(r"^@(\S+)\s+(?:งาน|tasks?)\s*(.*)?$",ts,re.I)
-    if am2:
-        aname,auid=_resolve_name(am2.group(1).strip())
-        date_part=(am2.group(2) or "").strip()
-        due=parse_date_only(date_part) if date_part else None
-        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
-        return _show_tasks(my, aname, date_part if due else None)
-
-    # Pattern: งาน@ชื่อ [date] — e.g. "งาน@Sun", "งาน@Sun 30/03"
-    am3=re.match(r"^(?:งาน|tasks?)@(\S+)\s*(.*)?$",ts,re.I)
-    if am3:
-        aname,auid=_resolve_name(am3.group(1).strip())
-        date_part=(am3.group(2) or "").strip()
-        due=parse_date_only(date_part) if date_part else None
-        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
-        return _show_tasks(my, aname, date_part if due else None)
-
-    # Pattern: @ชื่อ สรุปงาน — e.g. "@Sun สรุปงาน"
-    am4=re.match(r"^@(\S+)\s+(?:สรุปงาน|สรุป)\s*$",ts,re.I)
-    if am4:
-        aname,auid=_resolve_name(am4.group(1).strip())
-        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None)
-        if not my: return aqr("🎉 ไม่มีงานค้างของ {}".format(aname))
-        lines=["📊 สรุปงานของ {} ({} งาน)".format(aname,len(my)),""]
-        for i,t in enumerate(my,1):
-            dd=t.get("due_date","") or "-"
-            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
-        return aqr("\n".join(lines))
-
-    # Pattern: สรุปงาน@ชื่อ — e.g. "สรุปงาน@Sun"
-    am5=re.match(r"^(?:สรุปงาน|สรุป)@(\S+)\s*$",ts,re.I)
-    if am5:
-        aname,auid=_resolve_name(am5.group(1).strip())
-        my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None)
-        if not my: return aqr("🎉 ไม่มีงานค้างของ {}".format(aname))
-        lines=["📊 สรุปงานของ {} ({} งาน)".format(aname,len(my)),""]
-        for i,t in enumerate(my,1):
-            dd=t.get("due_date","") or "-"
-            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
-        return aqr("\n".join(lines))
-
-    # Pattern: ดูงาน [date] — MY tasks, optionally filtered by date
-    m_view=re.match(r"^(?:ดูงาน|list|tasks)\s*(.*)?$",ts,re.I)
-    if m_view:
-        date_part=(m_view.group(1) or "").strip()
-        due=parse_date_only(date_part) if date_part else None
-        my=query_tasks_by_person(cid, uid=uid, due_date=due)
-        return _show_tasks(my, "ฉัน", date_part if due else None)
-
-    # Pattern: งานค้าง — งานค้างของตัวเอง (filtered by uid) as carousel mini cards + LIFF
-    if tl in ["งานค้าง","รายการ","my tasks"]:
-        my=query_tasks_by_person(cid, uid=uid)
-        if not my: return aqr("🎉 ไม่มีงานค้างของคุณ!")
-        cards=[build_mini_card(dict(t),i) for i,t in enumerate(my,1)]
-        alt="📋 งานค้างของคุณ {} งาน".format(len(my))
-        if len(cards)==1:
-            return aqr({"type":"flex","altText":alt,"contents":cards[0]})
-        return aqr({"type":"flex","altText":alt,"contents":{"type":"carousel","contents":cards[:10]}})
-
-    # Pattern: งานทุกคน — แยก 1 คน = 1 bubble
-    if tl in ["งานทุกคน","all tasks","alltasks"]: return build_all_persons_flex(cid)
-
-    # Pattern: สรุปงาน — MY summary
-    if tl in ["สรุปงาน"]:
-        my=query_tasks_by_person(cid, uid=uid)
-        if not my: return aqr("🎉 ไม่มีงานค้างของคุณ!")
-        lines=["📊 สรุปงานของคุณ ({} งาน)".format(len(my)),""]
-        for i,t in enumerate(my,1):
-            dd=t.get("due_date","") or "-"
-            lines.append("{}. {} [📅{}]".format(i,t["title"],dd))
-        return aqr("\n".join(lines))
-
-    # Pattern: งานฉัน / งานของฉัน — alias for ดูงาน (my tasks)
-    if tl in ["งานฉัน","งานของฉัน","my tasks","mytasks"]:
-        my=query_tasks_by_person(cid, uid=uid)
-        return _show_tasks(my, "ฉัน")
-
-    # Pattern: [date]งาน@ชื่อ — e.g. "30/03งาน@Sun"
-    am6=re.match(r"^(\S+?)(?:งาน|tasks?)@(\S+)\s*$",ts,re.I)
-    if am6:
-        date_part=am6.group(1).strip()
-        due=parse_date_only(date_part)
-        if due:
-            aname,auid=_resolve_name(am6.group(2).strip())
-            my=query_tasks_by_person(cid, uid=auid, name=aname if not auid else None, due_date=due)
-            return _show_tasks(my, aname, date_part)
+    if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
 
     # log command
     m=re.match(r"^(?:log|ประวัติ)\s*(\d+)",ts,re.I)
@@ -1312,14 +687,37 @@ def callback():
             uid=src.get("userId",""); name=get_profile(uid) if uid else ""
             if name and cid!=uid: register_member(cid,uid,name)
             if ev.get("type")=="message" and ev.get("message",{}).get("type")=="text":
-                r=process_text(ev["message"]["text"].strip(),cid,uid,name)
-                if r: reply_msg(tok,r,_cid=cid)
+                msg=ev["message"]; txt=msg.get("text","").strip()
+                # ── Parse @mention for task assignment ──
+                mention_info=msg.get("mention",{}).get("mentionees",[])
+                if mention_info and len(mention_info)>0:
+                    m_uid=mention_info[0].get("userId","")
+                    m_idx=mention_info[0].get("index",0)
+                    m_len=mention_info[0].get("length",0)
+                    m_name=txt[m_idx:m_idx+m_len].lstrip("@").strip() if m_idx+m_len<=len(txt) else ""
+                    if m_uid and m_name: register_member(cid,m_uid,m_name)
+                    rest=txt[m_idx+m_len:].strip()
+                    # "@Name เพิ่ม task" → assign task to Name
+                    am=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",rest,re.I)
+                    if am:
+                        t=add_task(cid,am.group(1).strip(),by=name,by_uid=uid,assign_to=m_name,assign_to_uid=m_uid)
+                        reply_msg(tok,aqr("📌 มอบหมายงาน \"{}\" ให้ {} แล้ว".format(am.group(1).strip(),m_name)))
+                        continue
+                    # "@Name งาน" → list tasks assigned to Name
+                    if rest in ["งาน","tasks","list","ดูงาน",""]:
+                        tasks=get_tasks_by_assignee(cid,assignee_uid=m_uid,assignee_name=m_name)
+                        if not tasks:
+                            reply_msg(tok,aqr("📋 {} ไม่มีงานค้าง 🎉".format(m_name)))
+                        elif len(tasks)==1:
+                            reply_msg(tok,aqr({"type":"flex","altText":"📋 งานของ {}".format(m_name),"contents":build_mini_card(tasks[0],1)}))
+                        else:
+                            reply_msg(tok,aqr({"type":"flex","altText":"📋 งานของ {} ({})".format(m_name,len(tasks)),"contents":{"type":"carousel","contents":[build_mini_card(t,i) for i,t in enumerate(tasks[:10],1)]}}))
+                        continue
+                r=process_text(txt,cid,uid,name)
+                if r: reply_msg(tok,r)
             elif ev.get("type")=="postback":
                 handle_pb(ev.get("postback",{}).get("data",""),cid,tok,uid,name)
-        except Exception as e:
-            import traceback; app.logger.error("Err: %s\n%s",e,traceback.format_exc())
-            try: push_msg(cid,"❌ error: {}".format(str(e)[:200]))
-            except: pass
+        except Exception as e: app.logger.error("Err: %s",e)
     return "OK"
 
 # ══════════════════════════════════════════════════════════════
@@ -1386,281 +784,15 @@ def api_upload():
     f.save(fpath)
     return jsonify({"url":"/uploads/"+fname})
 
-@app.route("/api/pending/<path:cid>")
-def api_pending(cid):
-    pend=get_pending_tasks(cid); done=get_completed_today(cid)
-    return jsonify({"pending":[dict(t) for t in pend],"done_today":[dict(t) for t in done]})
-
-@app.route("/api/batch-action",methods=["POST"])
-def api_batch():
-    d=request.get_json() or {}
-    author=d.get("author",""); author_uid=d.get("author_uid","")
-    results={"done":[],"deleted":[],"errors":[]}
-    for tid in d.get("done_ids",[]):
-        t=complete_task(int(tid),author,author_uid)
-        if t: results["done"].append(t["title"])
-        else: results["errors"].append(str(tid))
-    for tid in d.get("delete_ids",[]):
-        t=delete_task(int(tid),author,author_uid)
-        if t: results["deleted"].append(t["title"])
-        else: results["errors"].append(str(tid))
-    return jsonify({"ok":True,"results":results})
-
 @app.route("/api/members/<path:cid>")
 def api_members(cid):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=%s",(cid,))
-        rows = cur.fetchall()
+    with get_db() as c:
+        rows = c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=?",(cid,)).fetchall()
     return jsonify([{"uid":r["user_id"],"name":r["display_name"]} for r in rows])
-
-# ── Routine API ──────────────────────────────────────────────
-@app.route("/api/routines/<path:cid>")
-def api_routines(cid):
-    rlist=get_routines(cid, active_only=False)
-    return jsonify([{"id":r["id"],"title":r["title"],"type":r["routine_type"],
-        "day":r.get("day_of_month"),"assigned_to":r.get("assigned_to",""),
-        "assigned_to_uid":r.get("assigned_to_uid",""),"active":r.get("active",True),
-        "created_by":r.get("created_by","")} for r in rlist])
-
-@app.route("/api/routine",methods=["POST"])
-def api_add_routine():
-    d=request.json or {}
-    cid=d.get("chat_id",""); title=d.get("title",""); rtype=d.get("type","daily")
-    dom=d.get("day") ; ato=d.get("assigned_to",""); auid=d.get("assigned_to_uid","")
-    cby=d.get("created_by",""); cbuid=d.get("created_by_uid","")
-    if not cid or not title: return jsonify({"ok":False,"error":"missing fields"}),400
-    rid=add_routine(cid,title,routine_type=rtype,day_of_month=int(dom) if dom else None,
-        assigned_to=ato,assigned_to_uid=auid,created_by=cby,created_by_uid=cbuid)
-    return jsonify({"ok":True,"id":rid})
-
-@app.route("/api/routine/<int:rid>",methods=["DELETE"])
-def api_delete_routine(rid):
-    r=delete_routine(rid)
-    if r: return jsonify({"ok":True,"title":r["title"]})
-    return jsonify({"ok":False,"error":"not found"}),404
-
-@app.route("/api/routine/<int:rid>/toggle",methods=["POST"])
-def api_toggle_routine(rid):
-    d=request.json or {}
-    toggle_routine(rid, d.get("active",True))
-    return jsonify({"ok":True})
-
-# ── Routine LIFF Page ───────────────────────────────────────
-ROUTINE_PAGE_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>จัดการงานประจำ</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0F172A;color:#E2E8F0;padding:16px}
-h1{font-size:20px;text-align:center;margin-bottom:16px;color:#fff}
-.tabs{display:flex;gap:8px;margin-bottom:16px}
-.tab{flex:1;padding:10px;border-radius:10px;text-align:center;font-weight:700;font-size:14px;cursor:pointer;border:none}
-.tab.active-daily{background:#4ADE80;color:#0F172A}
-.tab.active-monthly{background:#F59E0B;color:#0F172A}
-.tab.inactive{background:#1E293B;color:#94A3B8}
-.card{background:#1E293B;border-radius:12px;padding:14px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
-.card .info{flex:1}
-.card .title{font-weight:700;font-size:15px}
-.card .meta{font-size:12px;color:#94A3B8;margin-top:4px}
-.card .del{background:#EF4444;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;font-weight:600}
-.card .pause{background:#334155;color:#F59E0B;border:none;border-radius:8px;padding:8px 10px;font-size:13px;cursor:pointer}
-.add-form{background:#1E293B;border-radius:12px;padding:16px;margin-bottom:16px}
-.add-form input,.add-form select{width:100%;padding:10px;border-radius:8px;border:1px solid #334155;background:#0F172A;color:#E2E8F0;font-size:14px;margin-bottom:8px}
-.add-form .row{display:flex;gap:8px}
-.add-form .row>*{flex:1}
-.btn-add{width:100%;padding:12px;border:none;border-radius:10px;background:#6366F1;color:#fff;font-weight:700;font-size:15px;cursor:pointer}
-.btn-add:active{background:#4F46E5}
-.empty{text-align:center;color:#64748B;padding:40px 0;font-size:14px}
-.badge-daily{background:#4ADE8033;color:#4ADE80;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
-.badge-monthly{background:#F59E0B33;color:#F59E0B;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
-</style>
-</head><body>
-<h1>🔄 จัดการงานประจำ</h1>
-<div class="add-form">
-  <input id="newTitle" placeholder="ชื่องาน routine ใหม่...">
-  <div class="row">
-    <select id="newType"><option value="daily">🔁 ประจำวัน</option><option value="monthly">📅 ประจำเดือน</option></select>
-    <input id="newDay" type="number" min="1" max="31" placeholder="วันที่" style="display:none">
-    <select id="newPerson"><option value="">👤 ตัวเอง</option></select>
-  </div>
-  <button class="btn-add" onclick="addRoutine()">➕ เพิ่มงานประจำ</button>
-</div>
-<div id="list"></div>
-<script>
-const API=location.origin+'/api';
-const params=new URLSearchParams(location.search);
-const chatId=params.get('chat_id')||'';
-let routines=[];
-document.getElementById('newType').onchange=function(){
-  document.getElementById('newDay').style.display=this.value==='monthly'?'block':'none';
-};
-async function load(){
-  try{
-    const [rRes,mRes]=await Promise.all([fetch(API+'/routines/'+chatId),fetch(API+'/members/'+chatId)]);
-    routines=await rRes.json();
-    const members=await mRes.json();
-    const sel=document.getElementById('newPerson');
-    members.forEach(m=>{const o=document.createElement('option');o.value=JSON.stringify({name:m.name,uid:m.uid});o.textContent='👤 '+m.name;sel.appendChild(o);});
-    render();
-  }catch(e){document.getElementById('list').innerHTML='<div class="empty">❌ โหลดไม่ได้</div>';}
-}
-function render(){
-  const el=document.getElementById('list');
-  if(!routines.length){el.innerHTML='<div class="empty">📭 ยังไม่มีงานประจำ</div>';return;}
-  el.innerHTML=routines.map((r,i)=>{
-    const badge=r.type==='daily'?'<span class="badge-daily">🔁 Daily</span>':'<span class="badge-monthly">📅 วันที่ '+r.day+'</span>';
-    const opacity=r.active?'1':'0.5';
-    return '<div class="card" style="opacity:'+opacity+'"><div class="info"><div class="title">'+badge+' '+r.title+'</div><div class="meta">👤 '+(r.assigned_to||'?')+' • สร้างโดย '+(r.created_by||'?')+'</div></div><button class="pause" onclick="tog('+r.id+','+r.active+')">'+(r.active?'⏸️':'▶️')+'</button><button class="del" onclick="del_('+r.id+')">🗑️</button></div>';
-  }).join('');
-}
-async function addRoutine(){
-  const title=document.getElementById('newTitle').value.trim();
-  const type=document.getElementById('newType').value;
-  const day=document.getElementById('newDay').value;
-  const pv=document.getElementById('newPerson').value;
-  if(!title){alert('กรุณาใส่ชื่องาน');return;}
-  let ato='',auid='';
-  if(pv){try{const p=JSON.parse(pv);ato=p.name;auid=p.uid;}catch(e){}}
-  const body={chat_id:chatId,title,type,assigned_to:ato,assigned_to_uid:auid};
-  if(type==='monthly'){if(!day||day<1||day>31){alert('ระบุวันที่ 1-31');return;}body.day=parseInt(day);}
-  await fetch(API+'/routine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  document.getElementById('newTitle').value='';
-  const rRes=await fetch(API+'/routines/'+chatId);routines=await rRes.json();render();
-}
-async function del_(id){if(!confirm('ลบงานประจำนี้?'))return;await fetch(API+'/routine/'+id,{method:'DELETE'});const r=await fetch(API+'/routines/'+chatId);routines=await r.json();render();}
-async function tog(id,cur){await fetch(API+'/routine/'+id+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!cur})});const r=await fetch(API+'/routines/'+chatId);routines=await r.json();render();}
-load();
-</script>
-</body></html>"""
 
 # ══════════════════════════════════════════════════════════════
 # Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
-SUMMARY_PAGE_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>สรุปงาน</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f5;padding-bottom:80px}
-.hdr{background:linear-gradient(135deg,#1DB446,#17a03d);color:#fff;padding:18px 16px;text-align:center}
-.hdr h1{font-size:18px;font-weight:700}.hdr p{font-size:13px;opacity:.85;margin-top:4px}
-.sec{padding:10px 14px 4px;font-size:14px;font-weight:700;color:#333}
-.done-sec{color:#1DB446}.pend-sec{color:#FF6B35}
-.card{background:#fff;margin:6px 14px;border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:all .2s}
-.card.sel-done{background:#E8F5E9;border-left:4px solid #1DB446}
-.card.sel-del{background:#FFEBEE;border-left:4px solid #E53935}
-.card .title{flex:1;font-size:14px;color:#333}
-.card.sel-del .title{text-decoration:line-through;color:#999}
-.card .by{font-size:11px;color:#999;margin-top:2px}
-.btn-grp{display:flex;gap:6px}
-.btn-grp button{width:36px;height:36px;border-radius:50%;border:2px solid #ddd;background:#fff;font-size:16px;cursor:pointer;transition:all .15s}
-.btn-grp button.act-done{border-color:#1DB446;background:#1DB446;color:#fff}
-.btn-grp button.act-del{border-color:#E53935;background:#E53935;color:#fff}
-.done-item{background:#fff;margin:4px 14px;border-radius:8px;padding:10px 14px;font-size:13px;color:#1DB446}
-.done-item span{margin-right:6px}
-.bar{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid #eee;padding:12px 16px;display:flex;gap:10px;align-items:center;z-index:99}
-.bar .info{flex:1;font-size:13px;color:#666}
-.bar .info b{color:#333}
-.bar button{padding:10px 24px;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;color:#fff}
-.bar .confirm-btn{background:#1DB446}.bar .confirm-btn:disabled{background:#ccc}
-.bar .clear-btn{background:#999;padding:10px 16px}
-.empty{text-align:center;padding:30px;color:#999;font-size:14px}
-.result{text-align:center;padding:40px 20px}
-.result .icon{font-size:48px}.result h2{margin:12px 0 8px;font-size:18px}
-.result p{font-size:13px;color:#666}
-.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;display:none;z-index:999}
-</style></head>
-<body>
-<div class="hdr"><h1>📊 สรุปประจำวัน</h1><p id="dateText"></p></div>
-<div id="main"></div>
-<div class="bar" id="actionBar" style="display:none">
-  <div class="info" id="barInfo"></div>
-  <button class="clear-btn" onclick="clearAll()">ล้าง</button>
-  <button class="confirm-btn" id="confirmBtn" onclick="confirmAll()">ยืนยัน</button>
-</div>
-<div class="toast" id="toast"></div>
-<script>
-var API="",chatId,selections={},tasks=[];
-function init(){
-  var sp=new URLSearchParams(location.search);
-  chatId=sp.get("chat_id");
-  if(!chatId){document.getElementById("main").innerHTML='<div class="empty">chat_id not found</div>';return}
-  document.getElementById("dateText").textContent=new Date().toLocaleDateString("th-TH",{day:"2-digit",month:"2-digit",year:"numeric"});
-  load();
-}
-async function load(){
-  try{
-    var r=await fetch(API+"/api/pending/"+encodeURIComponent(chatId));
-    if(!r.ok)throw new Error("load fail");
-    var d=await r.json();tasks=d.pending;
-    render(d.done_today,d.pending);
-  }catch(e){document.getElementById("main").innerHTML='<div class="empty">โหลดไม่ได้: '+e.message+'</div>'}
-}
-function render(done,pend){
-  var h='<div class="sec done-sec">✅ เสร็จวันนี้ ('+done.length+')</div>';
-  if(done.length==0)h+='<div class="done-item"><span>—</span> ยังไม่มี</div>';
-  else done.forEach(function(t){h+='<div class="done-item"><span>✔️</span>'+esc(t.title)+'</div>'});
-  h+='<div class="sec pend-sec">⏳ งานค้าง ('+pend.length+')</div>';
-  if(pend.length==0)h+='<div class="empty">🎉 ไม่มีงานค้าง!</div>';
-  else pend.forEach(function(t,i){
-    var cls="card";var sel=selections[t.id];
-    if(sel=="done")cls+=" sel-done";else if(sel=="delete")cls+=" sel-del";
-    h+='<div class="'+cls+'" id="card-'+t.id+'">';
-    h+='<div style="flex:1"><div class="title">'+(i+1)+'. '+esc(t.title)+'</div><div class="by">สั่งโดย: '+(t.added_by||"-")+'</div></div>';
-    h+='<div class="btn-grp">';
-    h+='<button onclick="toggle('+t.id+',&quot;done&quot;)" class="'+(sel=="done"?"act-done":"")+'">✓</button>';
-    h+='<button onclick="toggle('+t.id+',&quot;delete&quot;)" class="'+(sel=="delete"?"act-del":"")+'">✕</button>';
-    h+='</div></div>'});
-  document.getElementById("main").innerHTML=h;
-  updateBar();
-}
-function toggle(tid,action){
-  if(selections[tid]==action)delete selections[tid];else selections[tid]=action;
-  var card=document.getElementById("card-"+tid);
-  card.className="card"+(selections[tid]=="done"?" sel-done":selections[tid]=="delete"?" sel-del":"");
-  var btns=card.querySelectorAll(".btn-grp button");
-  btns[0].className=selections[tid]=="done"?"act-done":"";
-  btns[1].className=selections[tid]=="delete"?"act-del":"";
-  updateBar();
-}
-function updateBar(){
-  var doneIds=[],delIds=[];
-  for(var k in selections){if(selections[k]=="done")doneIds.push(k);else delIds.push(k)}
-  var total=doneIds.length+delIds.length;
-  var bar=document.getElementById("actionBar");
-  if(total==0){bar.style.display="none";return}
-  bar.style.display="flex";
-  var info="";
-  if(doneIds.length>0)info+='<b style="color:#1DB446">✅ เสร็จ '+doneIds.length+'</b> ';
-  if(delIds.length>0)info+='<b style="color:#E53935">🗑️ ลบ '+delIds.length+'</b>';
-  document.getElementById("barInfo").innerHTML=info;
-}
-function clearAll(){selections={};load()}
-async function confirmAll(){
-  var doneIds=[],delIds=[];
-  for(var k in selections){if(selections[k]=="done")doneIds.push(parseInt(k));else delIds.push(parseInt(k))}
-  if(doneIds.length+delIds.length==0)return;
-  document.getElementById("confirmBtn").disabled=true;document.getElementById("confirmBtn").textContent="กำลังทำ...";
-  try{
-    var r=await fetch(API+"/api/batch-action",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({done_ids:doneIds,delete_ids:delIds,author:"ผู้ใช้",author_uid:""})});
-    if(!r.ok)throw new Error("fail");
-    var d=await r.json();
-    var msg='<div class="result"><div class="icon">✅</div><h2>จัดการเรียบร้อย!</h2>';
-    if(d.results.done.length>0)msg+='<p style="color:#1DB446">เสร็จ: '+d.results.done.join(", ")+'</p>';
-    if(d.results.deleted.length>0)msg+='<p style="color:#E53935">ลบแล้ว: '+d.results.deleted.join(", ")+'</p>';
-    msg+='<p style="margin-top:16px;color:#999">กำลังกลับไปแชท...</p></div>';
-    document.getElementById("main").innerHTML=msg;
-    document.getElementById("actionBar").style.display="none";
-    setTimeout(function(){location.href="https://line.me/R/"},1500);
-  }catch(e){toast("ทำไม่ได้ ลองใหม่");document.getElementById("confirmBtn").disabled=false;document.getElementById("confirmBtn").textContent="ยืนยัน"}
-}
-function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML}
-function toast(m){var t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(function(){t.style.display="none"},2500)}
-init();
-</script></body></html>"""
-
 TASK_PAGE_HTML = """<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Task Detail</title>
@@ -1700,7 +832,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .arow{display:flex;gap:6px}
 .abtn{flex:1;padding:11px;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;text-align:center}
 .a-done{background:#E8F5E9;color:#1DB446}.a-ask{background:#FFF3E0;color:#E65100;border:1px solid #FFB74D}.a-del{background:#FFEBEE;color:#E53935}
-.cbar{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #eee;padding:8px 12px;display:flex;gap:8px;background:#fff;z-index:20;transition:bottom .15s}
+.cbar{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #eee;padding:8px 12px;display:flex;gap:8px;background:#fff;z-index:20}
 .cbar input{flex:1;padding:9px 14px;border:1.5px solid #ddd;border-radius:22px;font-size:13px;outline:none}.cbar input:focus{border-color:#1DB446}
 .cbar button{background:#1DB446;color:#fff;border:none;border-radius:50%;width:38px;height:38px;font-size:16px;cursor:pointer}
 .cbar .attach-btn{background:#FF9800;font-size:14px}
@@ -1762,10 +894,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 var API="",taskId,task,userName="",members=[];
 async function init(){
   var el=document.getElementById("loading");
-  var sp=new URLSearchParams(location.search);
-  taskId=sp.get("task_id");
-  if(!taskId){var ls=sp.get("liff.state");if(ls){var lp=new URLSearchParams(ls.replace(/^\?/,""));taskId=lp.get("task_id")}}
-  userName=decodeURIComponent(sp.get("name")||"");
+  taskId=new URLSearchParams(location.search).get("task_id");
+  userName=decodeURIComponent(new URLSearchParams(location.search).get("name")||"");
   if(!taskId){el.textContent="ไม่มี task_id";return}
   try{
     await load();
@@ -1850,35 +980,18 @@ function showConfirm(title,msg,onYes){document.getElementById("confirmTitle").te
   document.getElementById("confirmYes").onclick=function(){hideConfirm();onYes()};document.getElementById("confirmOverlay").style.display="flex"}
 function hideConfirm(){document.getElementById("confirmOverlay").style.display="none"}
 function toast(m){var t=document.getElementById("toast");t.textContent=m;t.style.display="block";setTimeout(function(){t.style.display="none"},2500)}
-(function(){var ci=document.getElementById("cinput");if(!ci)return;
-ci.addEventListener("focus",function(){setTimeout(function(){ci.scrollIntoView({block:"center",behavior:"smooth"});if(window.visualViewport){document.querySelector(".cbar").style.bottom=(window.innerHeight-window.visualViewport.height)+"px"}},300)});
-ci.addEventListener("blur",function(){document.querySelector(".cbar").style.bottom="0"});
-if(window.visualViewport){window.visualViewport.addEventListener("resize",function(){var cb=document.querySelector(".cbar");if(document.activeElement===ci){cb.style.bottom=(window.innerHeight-window.visualViewport.height)+"px"}else{cb.style.bottom="0"}})}})();
 init();
 </script></body></html>"""
 
 @app.route("/liff/task")
 def task_page():
-    from flask import make_response
-    resp = make_response(TASK_PAGE_HTML)
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    return resp
+    return TASK_PAGE_HTML
 
-@app.route("/liff/summary")
-def summary_page():
-    from flask import make_response
-    resp = make_response(SUMMARY_PAGE_HTML)
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    return resp
-
-@app.route("/liff/routines")
-def routines_page():
-    from flask import make_response
-    resp = make_response(ROUTINE_PAGE_HTML)
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    return resp
-
-# (auto summary removed)
+# ── Scheduled Summary ────────────────────────────────────────
+def send_daily():
+    for cid in get_active_chats():
+        try: push_msg(cid, build_summary(cid))
+        except Exception as e: app.logger.error("Sum err %s: %s",cid,e)
 
 @app.route("/uploads/<path:fname>")
 def serve_upload(fname):
@@ -1889,30 +1002,10 @@ def serve_upload(fname):
 @app.route("/", methods=["GET"])
 def health(): return "LINE Todo Bot v6 running!"
 
-@app.route("/debug/tasks/<path:cid>")
-def debug_tasks(cid):
-    """Debug endpoint — ดูข้อมูลงานในกลุ่ม"""
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT id,title,status,due_date,assigned_to,assigned_to_uid,added_by,added_by_user_id FROM tasks WHERE chat_id=%s ORDER BY id DESC LIMIT 20",(cid,))
-            tasks = cur.fetchall()
-            cur.execute("SELECT * FROM routines WHERE chat_id=%s",(cid,))
-            routines = cur.fetchall()
-            cur.execute("SELECT * FROM chat_members WHERE chat_id=%s",(cid,))
-            members = cur.fetchall()
-        # Convert dates to strings for JSON
-        for t in tasks:
-            for k in ["due_date","created_at","completed_at"]:
-                if t.get(k) and hasattr(t[k],'isoformat'): t[k]=t[k].isoformat()
-        for r in routines:
-            for k in ["last_generated","created_at"]:
-                if r.get(k) and hasattr(r[k],'isoformat'): r[k]=r[k].isoformat()
-        return jsonify({"tasks":[dict(t) for t in tasks],"routines":[dict(r) for r in routines],"members":[dict(m) for m in members]})
-    except Exception as e:
-        return jsonify({"error":str(e)}),500
-
 init_db()
+sched = BackgroundScheduler(timezone="Asia/Bangkok")
+sched.add_job(send_daily, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
+sched.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
