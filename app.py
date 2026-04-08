@@ -793,7 +793,7 @@ def api_members(cid):
 # ══════════════════════════════════════════════════════════════
 # Task Detail Page (No LIFF SDK required)
 # ══════════════════════════════════════════════════════════════
-TASK_PAGE_HTML = """<!DOCTYPE html>
+TASK_PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Task Detail</title>
 <style>
