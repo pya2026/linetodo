@@ -7,8 +7,10 @@ LINE Todo Bot v6 — LIFF Hybrid + Activity Log
 """
 
 import os, re, json, hashlib, hmac, base64
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
+
+TH_TZ = timezone(timedelta(hours=7))  # UTC+7 เวลาไทย
 
 import requests, psycopg2, psycopg2.extras
 from flask import Flask, request, abort, jsonify
@@ -101,6 +103,12 @@ def init_db():
                      WHERE m.chat_id = t.chat_id AND m.user_id = t.added_by_user_id
                        AND (t.assigned_to IS NULL OR t.assigned_to = '')
                        AND t.added_by_user_id IS NOT NULL AND t.added_by_user_id != ''""")
+        # Backfill 3: งานที่มี assigned_to (ชื่อ) แต่ assigned_to_uid ว่าง → ดึง uid จาก chat_members
+        c.execute("""UPDATE tasks t SET assigned_to_uid = m.user_id
+                     FROM chat_members m
+                     WHERE m.chat_id = t.chat_id AND m.display_name = t.assigned_to
+                       AND (t.assigned_to_uid IS NULL OR t.assigned_to_uid = '')
+                       AND t.assigned_to IS NOT NULL AND t.assigned_to != ''""")
         # ── Routines table ──
         c.execute("""CREATE TABLE IF NOT EXISTS routines (
             id SERIAL PRIMARY KEY,
@@ -149,7 +157,7 @@ def clear_pending(uid, cid):
 def parse_due_date(text):
     """แยก due date ออกจาก text — format: วันที่ + งาน เช่น 'พรุ่งนี้ ส่งรายงาน' หรือ '30/03 ส่งเอกสาร'"""
     from datetime import timedelta
-    today=datetime.now().date()
+    today=datetime.now(TH_TZ).date()
     # พรุ่งนี้/มะรืน
     m=re.match(r'^(พรุ่งนี้|มะรืน|วันนี้|tomorrow|today)\s+(.+)',text,re.I)
     if m:
@@ -184,7 +192,7 @@ def parse_due_date(text):
 def parse_date_only(text):
     """Parse date from text (date only, no task title needed). Returns YYYY-MM-DD or None."""
     from datetime import timedelta, date
-    today=datetime.now().date()
+    today=datetime.now(TH_TZ).date()
     t=text.strip().lower()
     if t in ["พรุ่งนี้","tomorrow"]: return (today+timedelta(days=1)).strftime("%Y-%m-%d")
     if t in ["มะรืน"]: return (today+timedelta(days=2)).strftime("%Y-%m-%d")
@@ -209,10 +217,21 @@ def query_tasks_by_person(cid, uid=None, name=None, due_date=None):
     with get_db() as conn:
         cur = conn.cursor()
         if uid:
-            # งานที่ assigned ให้คนนี้ + งานเก่าที่ assigned ว่างแต่คนนี้สร้าง
+            # หา display_name จาก chat_members ถ้าไม่ได้ส่งมา
+            dname = name or ""
+            if not dname:
+                cur.execute("SELECT display_name FROM chat_members WHERE chat_id=%s AND user_id=%s",(cid,uid))
+                row = cur.fetchone()
+                if row: dname = row["display_name"]
+            # งานที่ assigned ให้คนนี้ (by uid) + งานเก่าที่ assigned ว่างแต่คนนี้สร้าง + งานที่ assigned by name แต่ uid ว่าง
             sql=("SELECT * FROM tasks WHERE chat_id=%s AND status='pending' "
-                 "AND (assigned_to_uid=%s OR (COALESCE(assigned_to_uid,'')='' AND added_by_user_id=%s))")
+                 "AND (assigned_to_uid=%s "
+                 "OR (COALESCE(assigned_to_uid,'')='' AND added_by_user_id=%s)")
             params=[cid, uid, uid]
+            if dname:
+                sql += " OR (COALESCE(assigned_to_uid,'')='' AND assigned_to=%s)"
+                params.append(dname)
+            sql += ")"
         elif name:
             sql="SELECT * FROM tasks WHERE chat_id=%s AND status='pending' AND assigned_to LIKE %s"
             params=[cid, "%"+name+"%"]
@@ -263,7 +282,7 @@ def get_completed_today(cid):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM tasks WHERE chat_id=%s AND status='done' AND completed_at::date=%s ORDER BY completed_at",
-            (cid,datetime.now().strftime("%Y-%m-%d")))
+            (cid,datetime.now(TH_TZ).strftime("%Y-%m-%d")))
         return cur.fetchall()
 
 def complete_task(tid, by_name="", by_uid=""):
@@ -593,7 +612,7 @@ def build_all_persons_flex(cid):
 
 # ── Summary with interactive link ─────────────────────────────
 def build_summary(cid):
-    now=datetime.now(); done=get_completed_today(cid); pend=get_pending_tasks(cid)
+    now=datetime.now(TH_TZ); done=get_completed_today(cid); pend=get_pending_tasks(cid)
     di=[{"type":"text","text":"  ✔️ {}".format(t["title"]),"size":"xs","color":"#1DB446","wrap":True} for t in done] or [{"type":"text","text":"  — ยังไม่มี","size":"xs","color":"#999999"}]
     pi=[]
     for i,t in enumerate(pend,1):
@@ -638,7 +657,7 @@ def _to_date(v):
 
 def get_today_tasks(cid):
     """งานที่ due วันนี้ + งานค้างที่ไม่มี due"""
-    today=datetime.now().date()
+    today=datetime.now(TH_TZ).date()
     pend=get_pending_tasks(cid)
     today_tasks=[t for t in pend if _to_date(t.get("due_date"))==today]
     no_due=[t for t in pend if not t.get("due_date")]
@@ -656,7 +675,7 @@ def build_clockin(cid, uid="", name=""):
         return aqr("❌ เข้างาน error: {}".format(str(e)[:150]))
 
 def _build_clockin_inner(cid, uid="", name=""):
-    now=datetime.now()
+    now=datetime.now(TH_TZ)
     today=now.date()
     # Auto-create routine tasks
     routine_created = generate_routine_tasks(cid, uid, name) if uid else []
@@ -724,7 +743,7 @@ def build_clockout(cid, uid="", name=""):
         return aqr("❌ เลิกงาน error: {}".format(str(e)[:150]))
 
 def _build_clockout_inner(cid, uid="", name=""):
-    now=datetime.now()
+    now=datetime.now(TH_TZ)
     # งานที่เสร็จวันนี้ของผู้ส่ง
     all_done=get_completed_today(cid)
     # filter เฉพาะงานของผู้ส่ง: assigned_to_uid ตรง หรือ assigned ว่างแต่เป็นคนสร้าง
@@ -752,19 +771,22 @@ def _build_clockout_inner(cid, uid="", name=""):
             body.append({"type":"text","text":"  {}. {}{}".format(i,t["title"],tag),"size":"xs","color":"#FF6B35","wrap":True})
     else:
         body.append({"type":"text","text":"  — ไม่มีงานค้าง! 🎉","size":"xs","color":"#1DB446"})
-    # สถานะ
+    # สถานะ (แสดงใน footer)
     if my_done and not my_pend: st,sc="🏆 ยอดเยี่ยม! เคลียร์หมดแล้ว","#1DB446"
     elif my_done: st,sc="👍 เสร็จ {} ค้าง {}".format(len(my_done),len(my_pend)),"#FF8C00"
     else: st,sc="💪 พรุ่งนี้สู้ใหม่!","#FF6B35"
-    body.append({"type":"separator","margin":"lg"})
-    body.append({"type":"text","text":st,"size":"sm","color":sc,"weight":"bold","margin":"md","align":"center"})
+    su=summary_page_url(cid)
+    footer_c=[{"type":"text","text":st,"size":"sm","color":sc,"align":"center","weight":"bold"}]
+    if su and my_pend:
+        footer_c.append({"type":"button","action":{"type":"uri","label":"📋 จัดการงาน — เสร็จ / ลบ","uri":su},"style":"primary","color":"#FF6B35","height":"sm","margin":"lg"})
     dname=name or "คุณ"
     return aqr({"type":"flex","altText":"🌆 เลิกงาน","contents":{"type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","contents":[
             {"type":"text","text":"🌆 เลิกงาน — {}".format(dname),"weight":"bold","size":"lg","color":"#FF6B35"},
             {"type":"text","text":"📅 {} เวลา {} น.".format(now.strftime("%d/%m/%Y"),now.strftime("%H:%M")),"size":"sm","color":"#666666","margin":"sm"}
         ],"paddingAll":"15px","backgroundColor":"#FFF3E0"},
-        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"}}})
+        "body":{"type":"box","layout":"vertical","contents":body,"paddingAll":"15px","spacing":"xs"},
+        "footer":{"type":"box","layout":"vertical","contents":footer_c,"paddingAll":"12px"}}})
 
 def build_routine_list(cid):
     """แสดงรายการงานประจำทั้งหมดในกลุ่ม"""
