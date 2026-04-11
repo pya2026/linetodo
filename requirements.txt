@@ -2,3 +2,4 @@ flask
 requests
 APScheduler
 gunicorn
+psycopg2-binary
