@@ -781,7 +781,10 @@ def handle_pb(data, cid, tok, uid="", name=""):
 @app.route("/callback", methods=["POST"])
 def callback():
     sig=request.headers.get("X-Line-Signature",""); body=request.get_data(as_text=True)
-    if not verify_sig(body,sig): abort(400)
+    app.logger.info("Webhook received: %d bytes", len(body))
+    if not verify_sig(body,sig):
+        app.logger.error("Signature verification failed")
+        abort(400)
     for ev in json.loads(body).get("events",[]):
         try:
             tok=ev.get("replyToken",""); src=ev.get("source",{}); st=src.get("type","")
@@ -819,7 +822,9 @@ def callback():
                 if r: reply_msg(tok,r)
             elif ev.get("type")=="postback":
                 handle_pb(ev.get("postback",{}).get("data",""),cid,tok,uid,name)
-        except Exception as e: app.logger.error("Err: %s",e)
+        except Exception as e:
+            import traceback
+            app.logger.error("Err: %s\n%s", e, traceback.format_exc())
     return "OK"
 
 # ══════════════════════════════════════════════════════════════
@@ -1102,7 +1107,8 @@ def serve_upload(fname):
     return send_from_directory(upload_dir, fname)
 
 @app.route("/", methods=["GET"])
-def health(): return "LINE Todo Bot v6 running!"
+def health():
+    return jsonify({"status":"ok","db":"pg" if USE_PG else "sqlite","version":"v6.1"})
 
 init_db()
 
