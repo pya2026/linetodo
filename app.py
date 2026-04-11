@@ -12,7 +12,7 @@ from contextlib import contextmanager
 
 import requests
 from flask import Flask, request, abort, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
+# APScheduler removed — use "เลิกงาน" command instead
 
 app = Flask(__name__)
 
@@ -31,8 +31,7 @@ LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LIFF_ID                   = os.environ.get("LIFF_ID", "")
 APP_URL                   = os.environ.get("APP_URL", "")
 LINE_API_URL              = "https://api.line.me/v2/bot"
-DAILY_SUMMARY_HOUR        = int(os.environ.get("DAILY_SUMMARY_HOUR", "18"))
-DAILY_SUMMARY_MINUTE      = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
+# Scheduled summary removed — triggered by "เลิกงาน" command
 DATABASE_PATH             = os.environ.get("DATABASE_PATH", "todo.db")
 DATABASE_URL              = os.environ.get("DATABASE_URL", "")
 USE_PG                    = bool(DATABASE_URL)
@@ -307,6 +306,7 @@ def qr():
         {"type":"action","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list","displayText":"📋 ดูงาน"}},
         {"type":"action","action":{"type":"postback","label":"📊 สรุป","data":"action=summary","displayText":"📊 สรุป"}},
         {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
+        {"type":"action","action":{"type":"message","label":"🌙 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -557,7 +557,7 @@ def build_person_tasks(person_name, tasks, is_self=False):
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu","@ดูงาน"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","เลิกงาน","off","งานงาน","วิธีใช้","เมนู","menu","@ดูงาน"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -568,7 +568,14 @@ def process_text(text, cid, uid="", name=""):
         is_cmd=any(tl==c or tl.startswith(c+" ") for c in CMDS) or any(tl.startswith(p) for p in ["note ","แก้ ","เสร็จ","ลบ","log "])
         if not is_cmd:
             if pa["action"]=="waiting_add":
-                t=add_task(cid,ts,by=name,by_uid=uid); return build_task_flex(t["id"])
+                lines=[l.strip() for l in ts.split("\n") if l.strip()]
+                if len(lines)==1:
+                    t=add_task(cid,lines[0],by=name,by_uid=uid); return build_task_flex(t["id"])
+                else:
+                    added=[]
+                    for l in lines:
+                        t=add_task(cid,l,by=name,by_uid=uid); added.append(t)
+                    return aqr("✅ เพิ่ม {} งานแล้ว:\n{}".format(len(added),"\n".join("• {}".format(a["title"]) for a in added)))
             elif pa["action"]=="waiting_edit" and pa["data"]:
                 edit_task(int(pa["data"]),ts,name,uid); return build_task_flex(int(pa["data"]))
             elif pa["action"]=="waiting_comment" and pa["data"]:
@@ -577,6 +584,7 @@ def process_text(text, cid, uid="", name=""):
                 return aqr("❌ ไม่พบงานนี้")
 
     if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid)
+    if tl in ["เลิกงาน","off","ออก","เลิก"]: return build_summary(cid)
 
     # @ดูงาน → ดูงานค้างของตัวเอง
     if tl in ["@ดูงาน","@งานของฉัน","@mywork","@mytasks","งานของฉัน"]:
@@ -596,8 +604,17 @@ def process_text(text, cid, uid="", name=""):
             tasks = get_tasks_by_person(cid, name=query_name)
             return build_person_tasks(query_name, tasks)
 
-    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I)
-    if m: t=add_task(cid,m.group(1).strip(),by=name,by_uid=uid); return build_task_flex(t["id"])
+    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
+    if m:
+        raw=m.group(1).strip()
+        lines=[l.strip() for l in raw.split("\n") if l.strip()]
+        if len(lines)==1:
+            t=add_task(cid,lines[0],by=name,by_uid=uid); return build_task_flex(t["id"])
+        else:
+            added=[]
+            for l in lines:
+                t=add_task(cid,l,by=name,by_uid=uid); added.append(t)
+            return aqr("✅ เพิ่ม {} งานแล้ว:\n{}".format(len(added),"\n".join("• {}".format(a["title"]) for a in added)))
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
     if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
@@ -1088,9 +1105,6 @@ def serve_upload(fname):
 def health(): return "LINE Todo Bot v6 running!"
 
 init_db()
-sched = BackgroundScheduler(timezone="Asia/Bangkok")
-sched.add_job(send_daily, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
-sched.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
