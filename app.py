@@ -12,33 +12,18 @@ from contextlib import contextmanager
 
 import requests
 from flask import Flask, request, abort, jsonify
-# APScheduler removed — use "เลิกงาน" command instead
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
-
-# Fix JSON serialization for PostgreSQL datetime objects
-from datetime import date as date_type
-class CustomJSONProvider(app.json_provider_class):
-    def default(self, obj):
-        if isinstance(obj, datetime): return obj.isoformat()
-        if isinstance(obj, date_type): return obj.isoformat()
-        return super().default(obj)
-app.json_provider_class = CustomJSONProvider
-app.json = CustomJSONProvider(app)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LIFF_ID                   = os.environ.get("LIFF_ID", "")
 APP_URL                   = os.environ.get("APP_URL", "")
 LINE_API_URL              = "https://api.line.me/v2/bot"
-# Scheduled summary removed — triggered by "เลิกงาน" command
+DAILY_SUMMARY_HOUR        = int(os.environ.get("DAILY_SUMMARY_HOUR", "18"))
+DAILY_SUMMARY_MINUTE      = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
 DATABASE_PATH             = os.environ.get("DATABASE_PATH", "todo.db")
-DATABASE_URL              = os.environ.get("DATABASE_URL", "")
-USE_PG                    = bool(DATABASE_URL)
-
-if USE_PG:
-    import psycopg2, psycopg2.extras
-    app.logger.info("Using PostgreSQL: %s", DATABASE_URL[:30]+"...")
 
 def lh():
     return {"Content-Type":"application/json","Authorization":"Bearer "+LINE_CHANNEL_ACCESS_TOKEN}
@@ -62,138 +47,70 @@ def get_profile(uid):
     return ""
 
 # ── Database ─────────────────────────────────────────────────
-class DictRow:
-    """Wrap psycopg2 RealDictRow to behave like sqlite3.Row for dict(r)"""
-    pass
-
 @contextmanager
 def get_db():
-    if USE_PG:
-        c = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-        try: yield c; c.commit()
-        finally: c.close()
-    else:
-        c = sqlite3.connect(DATABASE_PATH); c.row_factory = sqlite3.Row
-        try: yield c; c.commit()
-        finally: c.close()
-
-def q(sql):
-    """Convert ? placeholders to %s for PostgreSQL"""
-    if USE_PG: return sql.replace("?", "%s")
-    return sql
+    c = sqlite3.connect(DATABASE_PATH); c.row_factory = sqlite3.Row
+    try: yield c; c.commit()
+    finally: c.close()
 
 def init_db():
-    if USE_PG:
-        with get_db() as c:
-            cur = c.cursor()
-            cur.execute("""CREATE TABLE IF NOT EXISTS tasks (
-                id SERIAL PRIMARY KEY, chat_id TEXT NOT NULL,
-                title TEXT NOT NULL, added_by TEXT DEFAULT '', added_by_user_id TEXT DEFAULT '',
-                assigned_to TEXT DEFAULT '', assigned_to_user_id TEXT DEFAULT '',
-                status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW(),
-                completed_at TIMESTAMP, due_date DATE)""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS comments (
-                id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL,
-                chat_id TEXT NOT NULL, author TEXT DEFAULT '', author_user_id TEXT DEFAULT '',
-                content TEXT NOT NULL, created_at TIMESTAMP DEFAULT NOW())""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS chat_members (
-                chat_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT DEFAULT '',
-                PRIMARY KEY (chat_id, user_id))""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS pending_actions (
-                user_chat_key TEXT PRIMARY KEY, action TEXT NOT NULL,
-                data TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW())""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS activity_log (
-                id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL,
-                chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
-                action TEXT NOT NULL, detail TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT NOW())""")
-            c.commit()
-    else:
-        with get_db() as c:
-            c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
-                title TEXT NOT NULL, added_by TEXT DEFAULT '', added_by_user_id TEXT DEFAULT '',
-                assigned_to TEXT DEFAULT '', assigned_to_user_id TEXT DEFAULT '',
-                status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                completed_at DATETIME, due_date DATE)""")
-            for col in ["added_by_user_id","assigned_to","assigned_to_user_id"]:
-                try: c.execute("ALTER TABLE tasks ADD COLUMN {} TEXT DEFAULT ''".format(col))
-                except: pass
-            c.execute("""CREATE TABLE IF NOT EXISTS comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
-                chat_id TEXT NOT NULL, author TEXT DEFAULT '', author_user_id TEXT DEFAULT '',
-                content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            for col in ["author_user_id"]:
-                try: c.execute("ALTER TABLE comments ADD COLUMN {} TEXT DEFAULT ''".format(col))
-                except: pass
-            c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
-                chat_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT DEFAULT '',
-                PRIMARY KEY (chat_id, user_id))""")
-            c.execute("""CREATE TABLE IF NOT EXISTS pending_actions (
-                user_chat_key TEXT PRIMARY KEY, action TEXT NOT NULL,
-                data TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
-                chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
-                action TEXT NOT NULL, detail TEXT DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-
-# ── DB Execute helpers ───────────────────────────────────────
-def db_exec(conn, sql, params=()):
-    """Execute SQL on either SQLite or PostgreSQL connection"""
-    if USE_PG:
-        cur = conn.cursor()
-        cur.execute(q(sql), params)
-        return cur
-    else:
-        return conn.execute(sql, params)
-
-def db_fetchone(conn, sql, params=()):
-    cur = db_exec(conn, sql, params)
-    row = cur.fetchone()
-    if row is None: return None
-    return dict(row)
-
-def db_fetchall(conn, sql, params=()):
-    cur = db_exec(conn, sql, params)
-    return [dict(r) for r in cur.fetchall()]
+    with get_db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
+            title TEXT NOT NULL, added_by TEXT DEFAULT '', added_by_user_id TEXT DEFAULT '',
+            assigned_to TEXT DEFAULT '', assigned_to_user_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME, due_date DATE)""")
+        for col in ["added_by_user_id","assigned_to","assigned_to_user_id"]:
+            try: c.execute("ALTER TABLE tasks ADD COLUMN {} TEXT DEFAULT ''".format(col))
+            except: pass
+        c.execute("""CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL, author TEXT DEFAULT '', author_user_id TEXT DEFAULT '',
+            content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        for col in ["author_user_id"]:
+            try: c.execute("ALTER TABLE comments ADD COLUMN {} TEXT DEFAULT ''".format(col))
+            except: pass
+        c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
+            chat_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT DEFAULT '',
+            PRIMARY KEY (chat_id, user_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pending_actions (
+            user_chat_key TEXT PRIMARY KEY, action TEXT NOT NULL,
+            data TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
+            action TEXT NOT NULL, detail TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
 
 # ── Activity Log ─────────────────────────────────────────────
 def log_activity(task_id, chat_id, user_name, user_id, action, detail=""):
     with get_db() as c:
-        db_exec(c, "INSERT INTO activity_log(task_id,chat_id,user_name,user_id,action,detail) VALUES(?,?,?,?,?,?)",
+        c.execute("INSERT INTO activity_log(task_id,chat_id,user_name,user_id,action,detail) VALUES(?,?,?,?,?,?)",
                   (task_id, chat_id, user_name, user_id, action, detail))
 
 def get_activity_log(task_id, limit=20):
     with get_db() as c:
-        return db_fetchall(c, "SELECT * FROM activity_log WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
-            (task_id, limit))
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM activity_log WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+            (task_id, limit)).fetchall()]
 
 # ── Pending Actions ──────────────────────────────────────────
 def set_pending(uid, cid, act, data=""):
     with get_db() as c:
-        if USE_PG:
-            db_exec(c, "INSERT INTO pending_actions VALUES(%s,%s,%s,%s) ON CONFLICT(user_chat_key) DO UPDATE SET action=%s,data=%s,created_at=%s",
-                    ("{}:{}".format(uid,cid),act,data,datetime.now().isoformat(),act,data,datetime.now().isoformat()))
-        else:
-            db_exec(c, "INSERT OR REPLACE INTO pending_actions VALUES(?,?,?,?)",("{}:{}".format(uid,cid),act,data,datetime.now().isoformat()))
+        c.execute("INSERT OR REPLACE INTO pending_actions VALUES(?,?,?,?)",("{}:{}".format(uid,cid),act,data,datetime.now().isoformat()))
 def get_pending(uid, cid):
     with get_db() as c:
-        r = db_fetchone(c, "SELECT action,data FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
+        r = c.execute("SELECT action,data FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),)).fetchone()
     return {"action":r["action"],"data":r["data"]} if r else None
 def clear_pending(uid, cid):
-    with get_db() as c: db_exec(c, "DELETE FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
+    with get_db() as c: c.execute("DELETE FROM pending_actions WHERE user_chat_key=?",("{}:{}".format(uid,cid),))
 
 # ── Task CRUD ────────────────────────────────────────────────
 def add_task(cid, title, by="", by_uid="", assign_to="", assign_to_uid=""):
     with get_db() as c:
-        if USE_PG:
-            cur = db_exec(c, "INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_user_id) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
-                          (cid,title.strip(),by,by_uid,assign_to,assign_to_uid))
-            tid = cur.fetchone()["id"]
-        else:
-            cur = db_exec(c, "INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_user_id) VALUES(?,?,?,?,?,?)",(cid,title.strip(),by,by_uid,assign_to,assign_to_uid))
-            tid = cur.lastrowid
+        cur = c.execute("INSERT INTO tasks(chat_id,title,added_by,added_by_user_id,assigned_to,assigned_to_user_id) VALUES(?,?,?,?,?,?)",(cid,title.strip(),by,by_uid,assign_to,assign_to_uid))
+    tid = cur.lastrowid
     detail = "สร้างงาน: {}".format(title.strip())
     if assign_to: detail += " → มอบหมายให้ {}".format(assign_to)
     log_activity(tid, cid, by, by_uid, "created", detail)
@@ -201,50 +118,54 @@ def add_task(cid, title, by="", by_uid="", assign_to="", assign_to_uid=""):
 
 def get_task(tid):
     with get_db() as c:
-        return db_fetchone(c, "SELECT * FROM tasks WHERE id=?",(tid,))
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+    return dict(r) if r else None
 
 def get_pending_tasks(cid):
     with get_db() as c:
-        return db_fetchall(c, "SELECT * FROM tasks WHERE chat_id=? AND status='pending' ORDER BY created_at",(cid,))
+        return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' ORDER BY created_at",(cid,)).fetchall()]
 
 def get_completed_today(cid):
     with get_db() as c:
-        return db_fetchall(c, "SELECT * FROM tasks WHERE chat_id=? AND status='done' AND DATE(completed_at)=? ORDER BY completed_at",
-            (cid,datetime.now().strftime("%Y-%m-%d")))
+        return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='done' AND DATE(completed_at)=? ORDER BY completed_at",
+            (cid,datetime.now().strftime("%Y-%m-%d"))).fetchall()]
 
 def get_tasks_by_assignee(cid, assignee_uid="", assignee_name=""):
     with get_db() as c:
         if assignee_uid:
-            return db_fetchall(c, "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_user_id=? ORDER BY created_at",(cid,assignee_uid))
+            return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to_user_id=? ORDER BY created_at",(cid,assignee_uid)).fetchall()]
         elif assignee_name:
-            return db_fetchall(c, "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to=? ORDER BY created_at",(cid,assignee_name))
+            return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND assigned_to=? ORDER BY created_at",(cid,assignee_name)).fetchall()]
         return []
 
 def get_tasks_by_person(cid, uid="", name=""):
+    """Get all pending tasks related to a person (created by OR assigned to)"""
     with get_db() as c:
         if uid:
-            return db_fetchall(c,
+            return [dict(r) for r in c.execute(
                 "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (added_by_user_id=? OR assigned_to_user_id=?) ORDER BY created_at",
-                (cid,uid,uid))
+                (cid,uid,uid)).fetchall()]
         elif name:
             pat = "%{}%".format(name)
-            return db_fetchall(c,
+            return [dict(r) for r in c.execute(
                 "SELECT * FROM tasks WHERE chat_id=? AND status='pending' AND (added_by LIKE ? OR assigned_to LIKE ?) ORDER BY created_at",
-                (cid,pat,pat))
+                (cid,pat,pat)).fetchall()]
         return []
 
 def find_member_by_name(cid, name_query):
+    """Find a chat member by partial name match"""
     with get_db() as c:
         pat = "%{}%".format(name_query)
-        return db_fetchall(c, "SELECT user_id, display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?",(cid,pat))
+        rows = c.execute("SELECT user_id, display_name FROM chat_members WHERE chat_id=? AND display_name LIKE ?",(cid,pat)).fetchall()
+        return [dict(r) for r in rows]
 
 def complete_task(tid, by_name="", by_uid=""):
     result = None
     with get_db() as c:
-        r = db_fetchone(c, "SELECT * FROM tasks WHERE id=?",(tid,))
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r and r["status"]=="pending":
-            db_exec(c, "UPDATE tasks SET status='done',completed_at=? WHERE id=?",(datetime.now().isoformat(),tid))
-            result = r
+            c.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?",(datetime.now().isoformat(),tid))
+            result = dict(r)
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "completed", "ทำเสร็จ: {}".format(result["title"]))
     return result
@@ -252,9 +173,9 @@ def complete_task(tid, by_name="", by_uid=""):
 def edit_task(tid, new_title, by_name="", by_uid=""):
     result = None
     with get_db() as c:
-        r = db_fetchone(c, "SELECT * FROM tasks WHERE id=?",(tid,))
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
-            db_exec(c, "UPDATE tasks SET title=? WHERE id=?",(new_title.strip(),tid))
+            c.execute("UPDATE tasks SET title=? WHERE id=?",(new_title.strip(),tid))
             result = {"id":tid,"old":r["title"],"new":new_title.strip(),"chat_id":r["chat_id"]}
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "edited", "แก้ไข: {} → {}".format(result["old"], result["new"]))
@@ -263,26 +184,21 @@ def edit_task(tid, new_title, by_name="", by_uid=""):
 def delete_task(tid, by_name="", by_uid=""):
     result = None
     with get_db() as c:
-        r = db_fetchone(c, "SELECT * FROM tasks WHERE id=?",(tid,))
+        r = c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
         if r:
-            result = r
-            db_exec(c, "DELETE FROM comments WHERE task_id=?",(tid,))
-            db_exec(c, "DELETE FROM tasks WHERE id=?",(tid,))
+            result = dict(r)
+            c.execute("DELETE FROM comments WHERE task_id=?",(tid,))
+            c.execute("DELETE FROM tasks WHERE id=?",(tid,))
     if result:
         log_activity(tid, result["chat_id"], by_name, by_uid, "deleted", "ลบงาน: {}".format(result["title"]))
     return result
 
 def get_active_chats():
     with get_db() as c:
-        rows = db_fetchall(c, "SELECT DISTINCT chat_id FROM tasks WHERE status='pending'")
-        return [r["chat_id"] for r in rows]
+        return [r["chat_id"] for r in c.execute("SELECT DISTINCT chat_id FROM tasks WHERE status='pending'").fetchall()]
 
 def register_member(cid, uid, name=""):
-    with get_db() as c:
-        if USE_PG:
-            db_exec(c, "INSERT INTO chat_members VALUES(%s,%s,%s) ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=%s",(cid,uid,name,name))
-        else:
-            db_exec(c, "INSERT OR REPLACE INTO chat_members VALUES(?,?,?)",(cid,uid,name))
+    with get_db() as c: c.execute("INSERT OR REPLACE INTO chat_members VALUES(?,?,?)",(cid,uid,name))
 
 def get_task_index(cid, tid):
     for i,t in enumerate(get_pending_tasks(cid),1):
@@ -292,12 +208,12 @@ def get_task_index(cid, tid):
 # ── Comments ─────────────────────────────────────────────────
 def add_comment(tid, cid, author, author_uid, content):
     with get_db() as c:
-        db_exec(c, "INSERT INTO comments(task_id,chat_id,author,author_user_id,content) VALUES(?,?,?,?,?)",(tid,cid,author,author_uid,content))
+        c.execute("INSERT INTO comments(task_id,chat_id,author,author_user_id,content) VALUES(?,?,?,?,?)",(tid,cid,author,author_uid,content))
     log_activity(tid, cid, author, author_uid, "commented", content[:50])
 
 def get_comments(tid):
     with get_db() as c:
-        return db_fetchall(c, "SELECT * FROM comments WHERE task_id=? ORDER BY created_at",(tid,))
+        return [dict(r) for r in c.execute("SELECT * FROM comments WHERE task_id=? ORDER BY created_at",(tid,)).fetchall()]
 
 # ── Quick Reply ──────────────────────────────────────────────
 def qr():
@@ -306,7 +222,6 @@ def qr():
         {"type":"action","action":{"type":"postback","label":"📋 ดูงาน","data":"action=list","displayText":"📋 ดูงาน"}},
         {"type":"action","action":{"type":"postback","label":"📊 สรุป","data":"action=summary","displayText":"📊 สรุป"}},
         {"type":"action","action":{"type":"message","label":"🌅 เข้างาน","text":"เข้างาน"}},
-        {"type":"action","action":{"type":"message","label":"🌙 เลิกงาน","text":"เลิกงาน"}},
         {"type":"action","action":{"type":"postback","label":"❓ วิธีใช้","data":"action=help","displayText":"❓ วิธีใช้"}},
     ]}
 def aqr(msg):
@@ -557,7 +472,7 @@ def build_person_tasks(person_name, tasks, is_self=False):
 
 # ── Text Commands ────────────────────────────────────────────
 CANCEL=["ยกเลิก","cancel","ไม่","no"]
-CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","เลิกงาน","off","งานงาน","วิธีใช้","เมนู","menu","@ดูงาน"]
+CMDS=["เพิ่ม","add","todo","เพิ่มงาน","งานค้าง","ดูงาน","list","tasks","สรุป","summary","เข้างาน","clock in","งานงาน","วิธีใช้","เมนู","menu","@ดูงาน"]
 
 def process_text(text, cid, uid="", name=""):
     ts=text.strip(); tl=ts.lower()
@@ -568,14 +483,7 @@ def process_text(text, cid, uid="", name=""):
         is_cmd=any(tl==c or tl.startswith(c+" ") for c in CMDS) or any(tl.startswith(p) for p in ["note ","แก้ ","เสร็จ","ลบ","log "])
         if not is_cmd:
             if pa["action"]=="waiting_add":
-                lines=[l.strip() for l in ts.split("\n") if l.strip()]
-                if len(lines)==1:
-                    t=add_task(cid,lines[0],by=name,by_uid=uid); return build_task_flex(t["id"])
-                else:
-                    added=[]
-                    for l in lines:
-                        t=add_task(cid,l,by=name,by_uid=uid); added.append(t)
-                    return aqr("✅ เพิ่ม {} งานแล้ว:\n{}".format(len(added),"\n".join("• {}".format(a["title"]) for a in added)))
+                t=add_task(cid,ts,by=name,by_uid=uid); return build_task_flex(t["id"])
             elif pa["action"]=="waiting_edit" and pa["data"]:
                 edit_task(int(pa["data"]),ts,name,uid); return build_task_flex(int(pa["data"]))
             elif pa["action"]=="waiting_comment" and pa["data"]:
@@ -584,7 +492,6 @@ def process_text(text, cid, uid="", name=""):
                 return aqr("❌ ไม่พบงานนี้")
 
     if tl in ["เข้างาน","clock in","เริ่มงาน"]: return build_clockin(cid)
-    if tl in ["เลิกงาน","off","ออก","เลิก"]: return build_summary(cid)
 
     # @ดูงาน → ดูงานค้างของตัวเอง
     if tl in ["@ดูงาน","@งานของฉัน","@mywork","@mytasks","งานของฉัน"]:
@@ -604,17 +511,8 @@ def process_text(text, cid, uid="", name=""):
             tasks = get_tasks_by_person(cid, name=query_name)
             return build_person_tasks(query_name, tasks)
 
-    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I|re.S)
-    if m:
-        raw=m.group(1).strip()
-        lines=[l.strip() for l in raw.split("\n") if l.strip()]
-        if len(lines)==1:
-            t=add_task(cid,lines[0],by=name,by_uid=uid); return build_task_flex(t["id"])
-        else:
-            added=[]
-            for l in lines:
-                t=add_task(cid,l,by=name,by_uid=uid); added.append(t)
-            return aqr("✅ เพิ่ม {} งานแล้ว:\n{}".format(len(added),"\n".join("• {}".format(a["title"]) for a in added)))
+    m=re.match(r"^(?:เพิ่ม|add|todo)\s+(.+)",ts,re.I)
+    if m: t=add_task(cid,m.group(1).strip(),by=name,by_uid=uid); return build_task_flex(t["id"])
     if tl in ["เพิ่ม","add","todo","เพิ่มงาน"]:
         set_pending(uid,cid,"waiting_add"); return aqr("📝 พิมพ์ชื่องานเลยครับ\n(พิมพ์ \"ยกเลิก\" เพื่อยกเลิก)")
     if tl in ["งานค้าง","ดูงาน","list","tasks","รายการ","ดู"]: return build_list_flex(cid)
@@ -889,7 +787,7 @@ def api_upload():
 @app.route("/api/members/<path:cid>")
 def api_members(cid):
     with get_db() as c:
-        rows = db_fetchall(c, "SELECT user_id,display_name FROM chat_members WHERE chat_id=?",(cid,))
+        rows = c.execute("SELECT user_id,display_name FROM chat_members WHERE chat_id=?",(cid,)).fetchall()
     return jsonify([{"uid":r["user_id"],"name":r["display_name"]} for r in rows])
 
 # ══════════════════════════════════════════════════════════════
@@ -1105,6 +1003,9 @@ def serve_upload(fname):
 def health(): return "LINE Todo Bot v6 running!"
 
 init_db()
+sched = BackgroundScheduler(timezone="Asia/Bangkok")
+sched.add_job(send_daily, "cron", hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE)
+sched.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
