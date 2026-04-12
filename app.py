@@ -48,17 +48,24 @@ def verify_sig(body, sig):
 def reply_msg(tok, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
-    r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs})
-    if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
+    try:
+        r = requests.post(LINE_API_URL+"/message/reply", headers=lh(), json={"replyToken":tok,"messages":msgs}, timeout=10)
+        if r.status_code!=200: app.logger.error("Reply err: %s %s", r.status_code, r.text)
+    except Exception as e:
+        app.logger.error("Reply exception: %s", e)
 def push_msg(to, msgs):
     if isinstance(msgs, str): msgs = [{"type":"text","text":msgs}]
     elif isinstance(msgs, dict): msgs = [msgs]
-    requests.post(LINE_API_URL+"/message/push", headers=lh(), json={"to":to,"messages":msgs})
+    try:
+        requests.post(LINE_API_URL+"/message/push", headers=lh(), json={"to":to,"messages":msgs}, timeout=10)
+    except Exception as e:
+        app.logger.error("Push exception: %s", e)
 def get_profile(uid):
     try:
-        r = requests.get(LINE_API_URL+"/profile/"+uid, headers=lh())
+        r = requests.get(LINE_API_URL+"/profile/"+uid, headers=lh(), timeout=5)
         if r.status_code==200: return r.json().get("displayName","")
-    except: pass
+    except Exception as e:
+        app.logger.warning("get_profile err for %s: %s", uid, e)
     return ""
 
 # ── Database ─────────────────────────────────────────────────
@@ -1118,9 +1125,36 @@ def serve_upload(fname):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status":"ok","db":"pg" if USE_PG else "sqlite","version":"v6.1"})
+    info = {"status":"ok","db":"pg" if USE_PG else "sqlite","version":"v6.2",
+            "has_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "has_secret": bool(LINE_CHANNEL_SECRET),
+            "app_url": APP_URL or "(not set)"}
+    # Quick DB check
+    try:
+        with get_db() as c:
+            db_fetchone(c, "SELECT COUNT(*) as cnt FROM tasks")
+        info["db_ok"] = True
+    except Exception as e:
+        info["db_ok"] = False; info["db_err"] = str(e)
+    return jsonify(info)
 
-init_db()
+try:
+    init_db()
+    app.logger.info("DB initialized OK (mode=%s)", "pg" if USE_PG else "sqlite")
+except Exception as e:
+    app.logger.error("DB init FAILED: %s", e)
+    import traceback; traceback.print_exc()
+    # Fallback to SQLite if PG fails
+    if USE_PG:
+        app.logger.warning("Falling back to SQLite")
+        USE_PG = False
+        DATABASE_PATH = os.environ.get("DATABASE_PATH", "todo.db")
+        try:
+            init_db()
+            app.logger.info("SQLite fallback OK")
+        except Exception as e2:
+            app.logger.error("SQLite fallback also failed: %s", e2)
+
+app.logger.info("Bot v6.2 started — webhook at /callback")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
