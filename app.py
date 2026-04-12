@@ -107,6 +107,16 @@ def init_db():
                 chat_id TEXT NOT NULL, user_name TEXT DEFAULT '', user_id TEXT DEFAULT '',
                 action TEXT NOT NULL, detail TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT NOW())""")
+            # Add missing columns to existing tables (safe to run repeatedly)
+            for col in ["added_by_user_id","assigned_to","assigned_to_user_id"]:
+                try: cur.execute("ALTER TABLE tasks ADD COLUMN {} TEXT DEFAULT ''".format(col))
+                except: c.rollback()
+            for col in ["author_user_id"]:
+                try: cur.execute("ALTER TABLE comments ADD COLUMN {} TEXT DEFAULT ''".format(col))
+                except: c.rollback()
+            for col in ["due_date"]:
+                try: cur.execute("ALTER TABLE tasks ADD COLUMN {} DATE".format(col))
+                except: c.rollback()
             c.commit()
     else:
         with get_db() as c:
