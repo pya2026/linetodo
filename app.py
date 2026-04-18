@@ -1169,6 +1169,29 @@ def serve_upload(fname):
     upload_dir = os.path.join(os.path.dirname(DATABASE_PATH) or ".", "uploads")
     return send_from_directory(upload_dir, fname)
 
+@app.route("/", methods=["GET"])
+def health():
+    info = {"status":"ok","db":"pg" if USE_PG else "sqlite","version":"v6.2",
+            "has_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "has_secret": bool(LINE_CHANNEL_SECRET),
+            "app_url": APP_URL or "(not set)"}
+    # Quick DB check
+    try:
+        with get_db() as c:
+            db_fetchone(c, "SELECT COUNT(*) as cnt FROM tasks")
+        info["db_ok"] = True
+    except Exception as e:
+        info["db_ok"] = False; info["db_err"] = str(e)
+    return jsonify(info)
+
+@app.route("/debug/tasks")
+def debug_tasks():
+    try:
+        with get_db() as c:
+            tasks = db_fetchall(c, "SELECT id, title, status, chat_id, created_at, completed_at FROM tasks ORDER BY id DESC LIMIT 20")
+        return jsonify({"db":"pg" if USE_PG else "sqlite", "tasks":tasks, "count":len(tasks)})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
+
 try:
     init_db()
     app.logger.info("DB initialized OK (mode=%s)", "pg" if USE_PG else "sqlite")
