@@ -1209,7 +1209,58 @@ except Exception as e:
         except Exception as e2:
             app.logger.error("SQLite fallback also failed: %s", e2)
 
-app.logger.info("Bot v6.2 started — webhook at /callback")
+app.logger.info("Bot v6.3 started — webhook at /callback")
+
+# ── Health & Debug endpoints ────────────────────────────────
+@app.route("/")
+def health():
+    return jsonify({"status":"ok","version":"6.3","db":"pg" if USE_PG else "sqlite"})
+
+@app.route("/debug/status")
+def debug_status():
+    """Check LINE API token, DB, and env vars"""
+    result = {"version":"6.3","db_type":"pg" if USE_PG else "sqlite"}
+    # Check LINE token
+    try:
+        r = requests.get("https://api.line.me/v2/bot/info", headers=lh(), timeout=5)
+        result["line_api_status"] = r.status_code
+        if r.status_code == 200:
+            info = r.json()
+            result["bot_name"] = info.get("displayName","?")
+            result["bot_id"] = info.get("userId","?")[:10]+"..."
+        else:
+            result["line_api_error"] = r.text[:200]
+    except Exception as e:
+        result["line_api_error"] = str(e)
+    # Check message quota
+    try:
+        r = requests.get("https://api.line.me/v2/bot/message/quota/consumption", headers=lh(), timeout=5)
+        if r.status_code == 200:
+            result["messages_used_this_month"] = r.json().get("totalUsage",0)
+    except: pass
+    try:
+        r = requests.get("https://api.line.me/v2/bot/message/quota", headers=lh(), timeout=5)
+        if r.status_code == 200:
+            result["message_quota"] = r.json()
+    except: pass
+    # Check DB
+    try:
+        with get_db() as c:
+            if USE_PG:
+                cur = c.cursor(); cur.execute("SELECT COUNT(*) as cnt FROM tasks"); cnt = cur.fetchone()["cnt"]
+            else:
+                cnt = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            result["db_ok"] = True
+            result["total_tasks"] = cnt
+    except Exception as e:
+        result["db_ok"] = False
+        result["db_error"] = str(e)
+    # Env vars check
+    result["has_token"] = bool(LINE_CHANNEL_ACCESS_TOKEN)
+    result["has_secret"] = bool(LINE_CHANNEL_SECRET)
+    result["has_app_url"] = bool(APP_URL)
+    result["app_url"] = APP_URL[:50] if APP_URL else ""
+    return jsonify(result)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
