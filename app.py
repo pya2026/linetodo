@@ -1211,11 +1211,6 @@ except Exception as e:
 
 app.logger.info("Bot v6.3 started — webhook at /callback")
 
-# ── Health & Debug endpoints ────────────────────────────────
-@app.route("/")
-def health():
-    return jsonify({"status":"ok","version":"6.3","db":"pg" if USE_PG else "sqlite"})
-
 @app.route("/debug/status")
 def debug_status():
     """Check LINE API token, DB, and env vars"""
