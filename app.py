@@ -869,22 +869,31 @@ def api_edit(tid):
 def api_done(tid):
     try:
         d=request.get_json() or {}
+        app.logger.info("api_done called: tid=%s, author=%s", tid, d.get("author",""))
         t=complete_task(tid,d.get("author",""),d.get("author_uid",""))
-        if t: return jsonify({"ok":True})
+        if t:
+            app.logger.info("api_done success: tid=%s", tid)
+            return jsonify({"ok":True})
         # check if already done
         existing=get_task(tid)
         if existing and existing.get("status")=="done":
+            app.logger.info("api_done already done: tid=%s", tid)
             return jsonify({"ok":True,"already_done":True})
-        return jsonify({"error":"fail"}),400
+        if existing:
+            app.logger.warning("api_done task exists but status=%s: tid=%s", existing.get("status"), tid)
+            return jsonify({"error":"task status is '{}', not 'pending'".format(existing.get("status","?"))}),400
+        app.logger.warning("api_done task not found: tid=%s", tid)
+        return jsonify({"error":"task not found (id={})".format(tid)}),404
     except Exception as e:
-        app.logger.error("api_done err: %s",e)
+        app.logger.error("api_done exception: tid=%s err=%s",tid,e)
+        import traceback; traceback.print_exc()
         # check if task got updated despite error
         try:
             existing=get_task(tid)
             if existing and existing.get("status")=="done":
                 return jsonify({"ok":True,"recovered":True})
         except: pass
-        return jsonify({"error":str(e)}),500
+        return jsonify({"error":"server error: {}".format(str(e))}),500
 
 @app.route("/api/task/<int:tid>/delete",methods=["DELETE"])
 def api_del(tid):
@@ -1101,25 +1110,29 @@ async function saveEdit(){var v=document.getElementById("einput").value.trim();i
 async function sendCmt(){var inp=document.getElementById("cinput"),v=inp.value.trim();if(!v)return;inp.value="";
   await fetch(API+"/api/task/"+taskId+"/comment",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:v,author:gn(),author_uid:""})});
   await load();toast("💬 เพิ่ม comment แล้ว!")}
-var DONE_HTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:80vh;background:#E8F5E9;border-radius:16px;margin:12px;padding:24px"><div style="font-size:64px;animation:pop 0.4s">✅</div><div style="font-size:22px;font-weight:bold;color:#2E7D32;margin-top:16px">เสร็จแล้ว!</div><div style="font-size:14px;color:#666;margin-top:8px">กำลังกลับไปแชท...</div><a href="https://line.me/R/" style="display:inline-block;margin-top:24px;padding:14px 40px;background:#06C755;color:#fff;border-radius:50px;text-decoration:none;font-size:16px;font-weight:bold">กลับไปแชท LINE</a></div><style>@keyframes pop{0%{transform:scale(0)}50%{transform:scale(1.3)}100%{transform:scale(1)}}</style><script>setTimeout(function(){location.href="https://line.me/R/"},1500)</script>';
+var DONE_HTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:80vh;background:#E8F5E9;border-radius:16px;margin:12px;padding:24px"><div style="font-size:64px;animation:pop 0.4s">✅</div><div style="font-size:22px;font-weight:bold;color:#2E7D32;margin-top:16px">เสร็จแล้ว!</div><div style="font-size:14px;color:#666;margin-top:8px">กำลังกลับไปแชท...</div><a href="https://line.me/R/" style="display:inline-block;margin-top:24px;padding:14px 40px;background:#06C755;color:#fff;border-radius:50px;text-decoration:none;font-size:16px;font-weight:bold">กลับไปแชท LINE</a></div><style>@keyframes pop{0%{transform:scale(0)}50%{transform:scale(1.3)}100%{transform:scale(1)}}</style>';
+function showDone(){document.getElementById("app").innerHTML=DONE_HTML;setTimeout(function(){location.href="https://line.me/R/"},1500)}
 function confirmDone(){showConfirm("✅ ยืนยันเสร็จ?","งาน: "+task.title,async function(){
   try{
     var r=await fetch(API+"/api/task/"+taskId+"/done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-    if(r.ok){document.getElementById("app").innerHTML=DONE_HTML;return}
+    if(r.ok){showDone();return}
+    var errData=null;try{errData=await r.json()}catch(e){}
     // API returned error - check if task is actually done
-    try{var chk=await fetch(API+"/api/task/"+taskId);if(chk.ok){var d=await chk.json();if(d.status==="done"){document.getElementById("app").innerHTML=DONE_HTML;return}}}catch(e2){}
-    toast("ทำไม่ได้ ลองใหม่")
+    try{var chk=await fetch(API+"/api/task/"+taskId);if(chk.ok){var d=await chk.json();if(d.status==="done"){showDone();return}}}catch(e2){}
+    toast("ทำไม่ได้: "+(errData&&errData.error?errData.error:"status "+r.status))
   }catch(e){
     // Network error - still check if task got done
-    try{var chk=await fetch(API+"/api/task/"+taskId);if(chk.ok){var d=await chk.json();if(d.status==="done"){document.getElementById("app").innerHTML=DONE_HTML;return}}}catch(e2){}
-    toast("เชื่อมต่อไม่ได้ ลองใหม่")}})}
-var DEL_HTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:80vh;background:#FFEBEE;border-radius:16px;margin:12px;padding:24px"><div style="font-size:64px;animation:pop 0.4s">🗑️</div><div style="font-size:22px;font-weight:bold;color:#C62828;margin-top:16px">ลบงานแล้ว</div><div style="font-size:14px;color:#666;margin-top:8px">กำลังกลับไปแชท...</div><a href="https://line.me/R/" style="display:inline-block;margin-top:24px;padding:14px 40px;background:#06C755;color:#fff;border-radius:50px;text-decoration:none;font-size:16px;font-weight:bold">กลับไปแชท LINE</a></div><style>@keyframes pop{0%{transform:scale(0)}50%{transform:scale(1.3)}100%{transform:scale(1)}}</style><script>setTimeout(function(){location.href="https://line.me/R/"},1500)</script>';
+    try{var chk=await fetch(API+"/api/task/"+taskId);if(chk.ok){var d=await chk.json();if(d.status==="done"){showDone();return}}}catch(e2){}
+    toast("เชื่อมต่อไม่ได้: "+e.message)}})}
+var DEL_HTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:80vh;background:#FFEBEE;border-radius:16px;margin:12px;padding:24px"><div style="font-size:64px;animation:pop 0.4s">🗑️</div><div style="font-size:22px;font-weight:bold;color:#C62828;margin-top:16px">ลบงานแล้ว</div><div style="font-size:14px;color:#666;margin-top:8px">กำลังกลับไปแชท...</div><a href="https://line.me/R/" style="display:inline-block;margin-top:24px;padding:14px 40px;background:#06C755;color:#fff;border-radius:50px;text-decoration:none;font-size:16px;font-weight:bold">กลับไปแชท LINE</a></div><style>@keyframes pop{0%{transform:scale(0)}50%{transform:scale(1.3)}100%{transform:scale(1)}}</style>';
+function showDel(){document.getElementById("app").innerHTML=DEL_HTML;setTimeout(function(){location.href="https://line.me/R/"},1500)}
 function confirmDelete(){showConfirm("⚠️ ยืนยันลบ?","ลบแล้วกู้คืนไม่ได้!",async function(){
   try{
     var r=await fetch(API+"/api/task/"+taskId+"/delete",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({author:gn(),author_uid:""})});
-    if(r.ok){document.getElementById("app").innerHTML=DEL_HTML;return}
-    toast("ลบไม่ได้ ลองใหม่")
-  }catch(e){toast("เชื่อมต่อไม่ได้ ลองใหม่")}})}
+    if(r.ok){showDel();return}
+    var errData=null;try{errData=await r.json()}catch(e){}
+    toast("ลบไม่ได้: "+(errData&&errData.error?errData.error:"status "+r.status))
+  }catch(e){toast("เชื่อมต่อไม่ได้: "+e.message)}})}
 async function uploadImg(input){
   if(!input.files||!input.files[0])return;
   var fd=new FormData();fd.append("file",input.files[0]);
@@ -1169,6 +1182,15 @@ def health():
     except Exception as e:
         info["db_ok"] = False; info["db_err"] = str(e)
     return jsonify(info)
+
+@app.route("/debug/tasks")
+def debug_tasks():
+    try:
+        with get_db() as c:
+            tasks = db_fetchall(c, "SELECT id, title, status, chat_id, created_at, completed_at FROM tasks ORDER BY id DESC LIMIT 20")
+        return jsonify({"db":"pg" if USE_PG else "sqlite", "tasks":tasks, "count":len(tasks)})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
 
 try:
     init_db()
