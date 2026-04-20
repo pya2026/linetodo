@@ -80,7 +80,9 @@ def get_db():
         try: yield c; c.commit()
         finally: c.close()
     else:
-        c = sqlite3.connect(DATABASE_PATH); c.row_factory = sqlite3.Row
+        c = sqlite3.connect(DATABASE_PATH, timeout=10); c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=5000")
         try: yield c; c.commit()
         finally: c.close()
 
@@ -1155,7 +1157,11 @@ init();
 
 @app.route("/liff/task")
 def task_page():
-    return TASK_PAGE_HTML
+    resp = app.make_response(TASK_PAGE_HTML)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 # ── Scheduled Summary ────────────────────────────────────────
 def send_daily():
